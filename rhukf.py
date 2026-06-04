@@ -98,7 +98,7 @@ def set_all_seeds(seed: int):
 torch.set_default_dtype(torch.float32)
 DTYPE = torch.float32
 DTYPE_FWD = torch.float32
-JITTER = 1e-8
+JITTER = 1e-7
 JITTER_TRIA = 1e-7
 
 # =========================================================================
@@ -112,13 +112,23 @@ ENV_CONFIGS: Dict[str, Dict] = {
     "CartPole-v1": {
         "obs_scale": [2.4, 3.0, 0.21, 2.0],
         "max_steps": 500,
+        "max_episodes": 120,
+        "eps_decay_steps": 2000,
+        "buffer_size": 50000,
         "results_dir": "results_cartpole",
+        "reward_threshold": 195,       # solved 기준 (avg reward)
+        "reward_ylim": [0, 520],       # 보상 그래프 y축 (CartPole: 0~500)
     },
     "LunarLander-v3": {
         # obs: [x, y, vx, vy, angle, angular_vel, left_leg_contact, right_leg_contact]
         "obs_scale": [1.5, 1.5, 5.0, 5.0, 3.14, 5.0, 1.0, 1.0],
         "max_steps": 1000,
+        "max_episodes": 1000,
+        "eps_decay_steps": 15000,
+        "buffer_size": 300000,
         "results_dir": "results_lunarlander",
+        "reward_threshold": 200,       # solved 기준 (avg reward)
+        "reward_ylim": [-450, 320],    # 보상 그래프 y축 (LunarLander: 음수 추락보상 포함)
     },
 }
 
@@ -127,7 +137,7 @@ ENV_CONFIGS: Dict[str, Dict] = {
 # =========================================================================
 @dataclass
 class Config:
-    env_name: str = "LunarLander-v3"  #"LunarLander-v3"
+    env_name: str = "CartPole-v1"  #"LunarLander-v3"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     max_episodes: int = 1000
     max_steps: int = 500
@@ -138,6 +148,9 @@ class Config:
     results_dir: Optional[str] = None
     
     _max_steps_explicit: bool = False  # --max_steps로 직접 지정 시 env 기본값이 덮어쓰지 않도록
+    _max_episodes_explicit: bool = False  # --episodes로 직접 지정 시 env 기본값이 덮어쓰지 않도록
+    _eps_decay_steps_explicit: bool = False  # --eps_decay_steps로 직접 지정 시 env 기본값이 덮어쓰지 않도록
+    _buffer_size_explicit: bool = False  # --buffer로 직접 지정 시 env 기본값이 덮어쓰지 않도록
 
 
     # Decoupling Mode 
@@ -145,35 +158,10 @@ class Config:
     #   'layer' = per-layer joint (K-FAC-like, within-layer covariance 보존)
     #   'fv'    = full vector (모든 파라미터를 한 블록으로, 가장 정확하지만 무거움)
     decoupling_mode: str = 'fv'
-    
-    # =========================================================================
-    # [Filter form] (FV 모드 전용)
-    #   'information' = SRRHUIF (square-root information form, 기존 v5 동작)
-    #   'covariance'  = RHUKF (covariance form, Kim et al. 2010 Alg 1)
-    # node/layer 모드는 'information' 만 지원.
-    # =========================================================================
-    filter_form: str = 'covariance'
-        
-    # =========================================================================
-    # [v7: State form] 절대 파라미터 추정 vs Error-State 추정
-    #   'absolute' = 기존 v6 동작. θ_t 자체를 필터링. node/layer/fv 모두 지원.
-    #   'error'    = θ_t = θ_anchor + Δθ_t, Δθ_t만 필터링 (anchor frozen during horizon).
-    #                FV 모드 전용. information/covariance 둘 다 지원.
-    # =========================================================================
-    state_form: str = 'error'
 
-    # =========================================================================
-    # [v9+: Measurement model] 측정 함수 / 측정값 정의 방식
-    #   'q_target'    = (기존 v6+ 동작) measurement = r + γ Q(s', a*; θ_T),
-    #                   h(w) = Q(s, a; w).
-    #                   장점: 빠른 수렴, 측정 단순. 단점: target net이 측정에 들어가
-    #   'pure_reward' = (신규) measurement = r,
-    #                   h(w) = Q(s, a; w) - γ Q(s', a*; w).
-    #                   장점: Kalman white noise 가정 만족, 균일 Q-drift는
-    #                   (1-γ) factor로 attenuate, cross-covariance cancellation으로
-    #                   forward 2회 → 계산 비용 ~1.5-1.8x.
-    # =========================================================================
-    measurement_mode: str = 'q_target'
+    filter_form: str = 'covariance' # information or covariance
+    state_form: str = 'error' # absolute or error
+    measurement_mode: str = 'q_target' # q_target or pure_reward
     
     # [v7: Anchor type] state_form='error'에서 θ_anchor 결정 방식
     #   'target'  = θ_anchor = θ_target (soft anchor, Moving Target 안전)
@@ -207,9 +195,6 @@ class Config:
     #   'init'   = 학습 시작시 frozen된 θ_init (RHE/FIR 정신에 더 가까움)
     h0_prior_source: str = 'target'
     
-    activation_fn: str = 'mish' #tanh
-    init_scheme: str = 'he' #xavier
-
     shared_layers: List[int] = field(default_factory=lambda: [24,24])   # [] = no hidden shared layers
     value_layers: List[int] = field(default_factory=lambda: [])
     advantage_layers: List[int] = field(default_factory=lambda: [])
@@ -217,23 +202,24 @@ class Config:
 
     use_dueling: bool = False # False로 두어 순수 DDQN 아키텍처 사용 (Layer 모드 최적화)
 
-    gamma: float = 0.99
-    scale_factor: float = 10.0
+    gamma: float = 0.9
+    scale_factor: float = 1.0
     
     tau_srrhuif: float = 0.02
     update_interval: int = 4
     
-    # [v7+] Target update 방식
-
-    target_update_mode: str = 'soft'
+    target_update_mode: str = 'hard'
     target_update_period: int = 200   # hard mode 시 호라이즌 업데이트 카운트 기준
     
-    buffer_size: int = 200000
+    activation_fn: str = 'mish' #tanh
+    init_scheme: str = 'he' #xavier
+
+    buffer_size: int = 50000
     batch_size: int = 128
     N_horizon: int = 6
     
-    q_init: float = 3e-2
-    q_end: float = 3e-2
+    q_init: float = 1e-2
+    q_end: float = 1e-2
 
     r_init: float = 1.5
     r_end: float = 1.5
@@ -244,7 +230,7 @@ class Config:
     p_init: float = 0.03
     p_delta_init: float = 0.05
     
-    alpha: float = 0.5
+    alpha: float = 0.1
     beta: float = 2.0
     kappa: float = 0.0
     
@@ -366,12 +352,7 @@ class Config:
                     f"[v9+] pure_reward mode: r_init={self.r_init} is large for y=r. "
                     f"r_init ∈ [0.1, 0.5] is recommended (y=r has small dynamic range)."
                 )
-            if self.tau_srrhuif > 0.01:
-                warnings.warn(
-                    f"[v9+] pure_reward mode: tau_srrhuif={self.tau_srrhuif} is large. "
-                    f"Uniform Q-drift still accumulates at (1-γ) rate; "
-                    f"recommend tau ≤ 0.005."
-                )
+
             if not self.use_per:
                 warnings.warn(
                     f"[v9+] pure_reward mode: use_per=False. pure_reward는 환경 보상으로만 "
@@ -416,7 +397,7 @@ class Config:
             )
         
         # [v7+] activation_fn 검증
-        valid_act = {'tanh', 'relu', 'leaky_relu', 'mish', 'gelu'}
+        valid_act = {'tanh', 'relu', 'leaky_relu', 'mish', 'gelu', 'silu'}
         if self.activation_fn not in valid_act:
             raise ValueError(
                 f"activation_fn='{self.activation_fn}' invalid. Must be one of {valid_act}."
@@ -506,6 +487,12 @@ class Config:
             self.obs_scale = env_cfg.get('obs_scale')
         if ('max_steps' in env_cfg) and (not self._max_steps_explicit):
             self.max_steps = env_cfg['max_steps']
+        if ('max_episodes' in env_cfg) and (not self._max_episodes_explicit):
+            self.max_episodes = env_cfg['max_episodes']
+        if ('eps_decay_steps' in env_cfg) and (not self._eps_decay_steps_explicit):
+            self.eps_decay_steps = env_cfg['eps_decay_steps']
+        if ('buffer_size' in env_cfg) and (not self._buffer_size_explicit):
+            self.buffer_size = env_cfg['buffer_size']
         results_dir = self.results_dir or env_cfg.get('results_dir', 'results')
         self.outdir = f"./{results_dir}/{self.param_str}"
         os.makedirs(self.outdir, exist_ok=True)
@@ -544,14 +531,17 @@ parser.add_argument('--r_init', type=float, default=cfg.r_init)
 parser.add_argument('--r_end', type=float, default=cfg.r_end,
                     help="Measurement noise std R 최종값 (eps-decay 종료점, default %(default)s)")
 parser.add_argument('--p_init', type=float, default=cfg.p_init)
-parser.add_argument('--episodes', type=int, default=cfg.max_episodes)
+parser.add_argument('--episodes', type=int, default=None,
+                    help="총 학습 에피소드 수. 미지정 시 ENV_CONFIGS의 env 기본값 사용.")
 parser.add_argument('--batch', type=int, default=cfg.batch_size)
+parser.add_argument('--buffer', type=int, default=None,
+                    help="Replay buffer 크기. 미지정 시 ENV_CONFIGS의 env 기본값 사용.")
 parser.add_argument('--N_horizon', type=int, default=cfg.N_horizon,
                     help="Receding horizon window size (default %(default)s)")
 parser.add_argument('--gamma', type=float, default=cfg.gamma,
                     help="Discount factor (default %(default)s)")
-parser.add_argument('--eps_decay_steps', type=int, default=cfg.eps_decay_steps,
-                    help="ε-greedy decay step count (default %(default)s)")
+parser.add_argument('--eps_decay_steps', type=int, default=None,
+                    help="ε-greedy decay step count. 미지정 시 ENV_CONFIGS의 env 기본값 사용.")
 parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
 parser.add_argument('--target_update_mode', type=str, default=cfg.target_update_mode,
                     choices=['soft', 'hard'],
@@ -604,7 +594,7 @@ parser.add_argument('--p_delta_init', type=float, default=cfg.p_delta_init,
 parser.add_argument('--use_twin', action='store_true',
                     help="Twin-Q (Clipped Double Q-Learning). 두 독립 (θ_1, θ_2)로 min target.")
 parser.add_argument('--activation_fn', type=str, default=cfg.activation_fn,
-                    choices=['tanh', 'relu', 'leaky_relu', 'mish', 'gelu'],
+                    choices=['tanh', 'relu', 'leaky_relu', 'mish', 'gelu', 'silu'],
                     help="히든 레이어 활성화 함수")
 parser.add_argument('--node_layer_other_source', type=str, default=cfg.node_layer_other_source,
                     choices=['current', 'prior'],
@@ -652,11 +642,18 @@ cfg.q_end = args.q_end
 cfg.r_init = args.r_init
 cfg.r_end = args.r_end
 cfg.p_init = args.p_init
-cfg.max_episodes = args.episodes
+if args.episodes is not None:
+    cfg.max_episodes = args.episodes
+    cfg._max_episodes_explicit = True
 cfg.batch_size = args.batch
+if args.buffer is not None:
+    cfg.buffer_size = args.buffer
+    cfg._buffer_size_explicit = True
 cfg.N_horizon = args.N_horizon
 cfg.gamma = args.gamma
-cfg.eps_decay_steps = args.eps_decay_steps
+if args.eps_decay_steps is not None:
+    cfg.eps_decay_steps = args.eps_decay_steps
+    cfg._eps_decay_steps_explicit = True
 cfg.tau_srrhuif = args.tau
 cfg.target_update_mode = args.target_update_mode
 cfg.target_update_period = args.target_update_period
@@ -876,6 +873,7 @@ def _get_act_fn(name: str):
     elif name == 'leaky_relu': return lambda x: F.leaky_relu(x, negative_slope=0.01)
     elif name == 'mish':     return F.mish
     elif name == 'gelu':     return F.gelu
+    elif name == 'silu':     return F.silu
     else:
         raise ValueError(f"Unknown activation_fn: {name}")
 
@@ -1443,7 +1441,7 @@ def compute_activation_health(theta, info, x, act_name, sat_thresh=0.95, dead_th
                    sat  = N/A (unbounded)
       leaky_relu:  dead = firing_rate < 1e-6 (음수 영역 고정, slope=0.01)
                    sat  = N/A
-      gelu/mish:   dead = max|post| < dead_thresh (음수 saturation 근처)
+      gelu/mish/silu: dead = max|post| < dead_thresh (음수 saturation 근처)
                    sat  = N/A (unbounded above)
 
     Returns: dict { layer_label: {n_units, n_sat, n_dead, sat_ratio, dead_ratio,
@@ -1476,7 +1474,7 @@ def compute_activation_health(theta, info, x, act_name, sat_thresh=0.95, dead_th
             firing_pos = (post > 0).float().mean(dim=1)
             dead_mask = firing_pos < 1e-6
             sat_mask = torch.zeros_like(dead_mask, dtype=torch.bool)
-        elif act_name in ('gelu', 'mish'):
+        elif act_name in ('gelu', 'mish', 'silu'):
             dead_mask = unit_max_abs < dead_thresh
             sat_mask = torch.zeros_like(dead_mask, dtype=torch.bool)
         else:
@@ -4275,11 +4273,20 @@ class LivePlotter:
         
         self.fig, self.axes = plt.subplots(1, 6, figsize=(30, 4))
         
+        # [env-aware] 보상 그래프 설정 (CartPole / LunarLander 등)
+        _env_cfg = ENV_CONFIGS.get(cfg.env_name, {})
+        self.reward_threshold = _env_cfg.get('reward_threshold', None)
+        self.reward_ylim = _env_cfg.get('reward_ylim', None)
+
         self.ax_r = self.axes[0]
         self.line_r_raw, = self.ax_r.plot([], [], 'b-', alpha=0.3)
         self.line_r_ma, = self.ax_r.plot([], [], 'b-', linewidth=2)
-        self.ax_r.axhline(y=195, color='g', linestyle='--', alpha=0.5)
-        self.ax_r.set_xlim(0, max_episodes); self.ax_r.set_ylim(0, 520)
+        if self.reward_threshold is not None:
+            self.ax_r.axhline(y=self.reward_threshold, color='g', linestyle='--', alpha=0.5)
+        self.ax_r.axhline(y=0, color='gray', linestyle=':', alpha=0.4)  # 음수보상 환경 기준선
+        self.ax_r.set_xlim(0, max_episodes)
+        if self.reward_ylim is not None:
+            self.ax_r.set_ylim(*self.reward_ylim)
         self.ax_r.set_title(f'Reward ({method_name})')
         
         self.ax_l = self.axes[1]
@@ -4374,7 +4381,16 @@ class LivePlotter:
         self.line_q1.set_data(ep_range, self.q_vals_1)
         
         for ax in self.axes: ax.relim(); ax.autoscale_view()
-        self.axes[0].set_ylim(0, max(max(self.rewards, default=520) * 1.1, 520))
+        # [env-aware] 보상 y축: 음수보상(LunarLander 추락 등)도 잘리지 않도록 데이터 기반으로 설정
+        if self.rewards:
+            r_min, r_max = min(self.rewards), max(self.rewards)
+            if self.reward_ylim is not None:
+                lo = min(self.reward_ylim[0], r_min - abs(r_min) * 0.1 - 1)
+                hi = max(self.reward_ylim[1], r_max * 1.1)
+            else:
+                pad = (r_max - r_min) * 0.1 + 1.0
+                lo, hi = r_min - pad, r_max + pad
+            self.axes[0].set_ylim(lo, hi)
         plt.savefig(f'{self.filename}_live.png', dpi=100)
     
     def save_diagnostic_plots(self):
