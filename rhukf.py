@@ -14,6 +14,7 @@ import sys
 import random
 import argparse
 import warnings
+import math
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 matplotlib.use('Agg')
@@ -98,8 +99,22 @@ def set_all_seeds(seed: int):
 torch.set_default_dtype(torch.float32)
 DTYPE = torch.float32
 DTYPE_FWD = torch.float32
-JITTER = 1e-7
-JITTER_TRIA = 1e-7
+JITTER = 1e-6
+JITTER_TRIA = 1e-6
+
+# ── Fallback 발동 횟수 카운터 (수치적 안정성 진단용) ──
+#   chol_1e5: Cholesky(1e-6 jitter) 실패 → 1e-5 jitter 재시도 횟수
+#   tria_qr : tria_operation_batch에서 Cholesky 실패 → QR 폴백 횟수
+FALLBACK_COUNTS = {'chol_1e5': 0, 'tria_qr': 0}
+
+def safe_cholesky_fallback(M, eye, base_jitter=JITTER):
+    """Cholesky를 base_jitter로 먼저 시도하고, 실패 시 1e-5 jitter로 재시도하며
+    그 횟수를 FALLBACK_COUNTS['chol_1e5']에 누적한다."""
+    try:
+        return torch.linalg.cholesky(M + base_jitter * eye)
+    except Exception:
+        FALLBACK_COUNTS['chol_1e5'] += 1
+        return torch.linalg.cholesky(M + 1e-5 * eye)
 
 # =========================================================================
 # 0. Environment Registry
@@ -160,7 +175,7 @@ class Config:
     decoupling_mode: str = 'fv'
 
     filter_form: str = 'covariance' # information or covariance
-    state_form: str = 'error' # absolute or error
+    state_form: str = 'absolute' # absolute or error
     measurement_mode: str = 'q_target' # q_target or pure_reward
     
     # [v7: Anchor type] state_form='error'에서 θ_anchor 결정 방식
@@ -208,15 +223,15 @@ class Config:
     tau_srrhuif: float = 0.02
     update_interval: int = 4
     
-    target_update_mode: str = 'hard'
+    target_update_mode: str = 'soft'
     target_update_period: int = 200   # hard mode 시 호라이즌 업데이트 카운트 기준
     
-    activation_fn: str = 'mish' #tanh
+    activation_fn: str = 'silu' #tanh
     init_scheme: str = 'he' #xavier
 
     buffer_size: int = 50000
     batch_size: int = 128
-    N_horizon: int = 6
+    N_horizon: int = 7
     
     q_init: float = 1e-2
     q_end: float = 1e-2
@@ -227,10 +242,10 @@ class Config:
     
     tikhonov_lambda: float = 1e-8
 
-    p_init: float = 0.03
+    p_init: float = 0.05
     p_delta_init: float = 0.05
     
-    alpha: float = 0.1
+    alpha: float = 0.01
     beta: float = 2.0
     kappa: float = 0.0
     
@@ -286,6 +301,13 @@ class Config:
     act_health_n_sample: int = 512   # 버퍼에서 뽑을 샘플 수
     act_health_sat_thresh: float = 0.95   # tanh/gelu 포화 임계 (|post| 평균)
     act_health_dead_thresh: float = 0.05  # 모든 활성화: 거의 0 출력 임계 (|post| 최대)
+
+    # [probe] Per-h activation regime + effective-gain (horizon 내부 fold-gain runaway 진단)
+    #   붕괴 시그니처: 한 horizon 안에서 mean_gain/frac_pos가 fold(h) 따라 증가
+    #   (건강하면 flat/감소). 매 h마다 forward가 추가되므로 반드시 cadence 게이팅.
+    diag_act_regime: bool = False
+    act_regime_every: int = 5     # N 에피소드마다만 프로브 (1이면 매 에피소드)
+    act_regime_warmup: int = 0    # 이 에피소드 이후부터만 프로브 (후반 phase 집중용)
     save_file_log: bool = True
 
     def __post_init__(self):
@@ -1224,7 +1246,8 @@ def tria_operation_batch(A):
         except Exception:
             # 만약 특이 행렬(Singular) 문제로 Cholesky가 실패하면,
             # 당황하지 않고 아래의 안전한 QR 로직으로 폴백(Fallback)합니다.
-            pass 
+            FALLBACK_COUNTS['tria_qr'] += 1
+            pass
 
     # 🛡️ [SAFE MODE] Node Decoupled 이거나, LD에서 Cholesky가 실패했을 때의 QR 로직
     _, r = torch.linalg.qr(A.transpose(-2, -1).contiguous())
@@ -1506,6 +1529,73 @@ def compute_activation_health(theta, info, x, act_name, sat_thresh=0.95, dead_th
         'sat_ratio': total_sat / max(total_units, 1),
         'dead_ratio': total_dead / max(total_units, 1),
     }
+    return stats
+
+
+@torch.no_grad()
+def act_deriv(name, x):
+    """활성화 함수의 analytic 도함수 f'(z). 진단 프로브 전용 (필터엔 backprop 금지).
+    x: pre-activation tensor."""
+    if name == 'silu':
+        s = torch.sigmoid(x)
+        return s * (1 + x * (1 - s))
+    if name == 'mish':
+        sp = F.softplus(x)
+        t = torch.tanh(sp)
+        return t + x * torch.sigmoid(x) * (1 - t * t)
+    if name == 'gelu':
+        Phi = 0.5 * (1 + torch.erf(x / 2 ** 0.5))
+        phi = torch.exp(-x * x / 2) / (2 * math.pi) ** 0.5
+        return Phi + x * phi
+    if name == 'tanh':
+        return 1 - torch.tanh(x) ** 2
+    if name == 'relu':
+        return (x > 0).to(x.dtype)
+    if name == 'leaky_relu':
+        return torch.where(x > 0, torch.ones_like(x), 0.01 * torch.ones_like(x))
+    return torch.ones_like(x)  # unknown → gain 1 가정 (linear)
+
+
+@torch.no_grad()
+def compute_act_regime(theta, info, x, act_name):
+    """[Per-h probe] horizon 내부 fold마다 활성화 regime + effective-gain 측정.
+
+    pre-activation z 기준:
+      frac_pos  = mean(z > 0)    — unbounded-gain 영역 점유율 (SiLU runaway 1순위)
+      frac_hi   = mean(z > 2.0)  — silu'>1 실제 증폭 구간 점유율
+      mean_gain = mean(f'(z))    — fold당 유효 게인 (analytic 도함수)
+      mean_z, max_abs_z
+
+    Returns: dict { layer_label: {frac_pos, frac_hi, mean_gain, mean_z, max_abs_z},
+                    '__total__': 전체 hidden pre-activation 집계 }
+    """
+    activations = collect_hidden_activations(theta, info, x)
+    stats = {}
+    all_pre = []
+    for label, pre, post in activations:
+        d = act_deriv(act_name, pre)
+        stats[label] = {
+            'frac_pos': float((pre > 0).float().mean().item()),
+            'frac_hi': float((pre > 2.0).float().mean().item()),
+            'mean_gain': float(d.mean().item()),
+            'mean_z': float(pre.mean().item()),
+            'max_abs_z': float(pre.abs().max().item()),
+        }
+        all_pre.append(pre.reshape(-1))
+
+    if all_pre:
+        cat = torch.cat(all_pre)
+        d_all = act_deriv(act_name, cat)
+        stats['__total__'] = {
+            'frac_pos': float((cat > 0).float().mean().item()),
+            'frac_hi': float((cat > 2.0).float().mean().item()),
+            'mean_gain': float(d_all.mean().item()),
+            'mean_z': float(cat.mean().item()),
+            'max_abs_z': float(cat.abs().max().item()),
+        }
+    else:
+        stats['__total__'] = {'frac_pos': 0.0, 'frac_hi': 0.0,
+                              'mean_gain': 0.0, 'mean_z': 0.0, 'max_abs_z': 0.0}
     return stats
 
 
@@ -2371,11 +2461,7 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
     # ═════════════════════════════════════════════════════════════
     # [B] Sigma points: chol(P_pred)으로 spread
     # ═════════════════════════════════════════════════════════════
-    try:
-        S_P_pred = torch.linalg.cholesky(P_pred + JITTER_TRIA * eye_n)
-    except Exception:
-        # PSD 복구: 더 큰 jitter
-        S_P_pred = torch.linalg.cholesky(P_pred + 1e-4 * eye_n)
+    S_P_pred = safe_cholesky_fallback(P_pred, eye_n, JITTER_TRIA)
     
     scaled_P = fv_cache.gamma_sigma * S_P_pred  # [n_x, n_x]
     unified = fv_cache.unified_thetas  # [num_sigma, n_x]
@@ -2461,10 +2547,7 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
     # [G] Kalman gain K = P_xz · P_zz⁻¹ via Cholesky(P_zz)
     # ═════════════════════════════════════════════════════════════
     eye_batch = torch.eye(batch_sz, dtype=DTYPE, device=device)
-    try:
-        L_zz = torch.linalg.cholesky(P_zz + JITTER * eye_batch)
-    except Exception:
-        L_zz = torch.linalg.cholesky(P_zz + 1e-4 * eye_batch)
+    L_zz = safe_cholesky_fallback(P_zz, eye_batch)
     
     # K = P_xz @ inv(P_zz) = P_xz @ inv(L_zz^T) @ inv(L_zz)
     # 두 번의 triangular solve로 수치 안정적으로
@@ -3161,10 +3244,7 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     P_delta_pred = 0.5 * (P_delta_pred + P_delta_pred.t())
     
     # ── Sigma in error space ────────────────────────────────────────
-    try:
-        S_P_pred = torch.linalg.cholesky(P_delta_pred + JITTER_TRIA * eye_n)
-    except Exception:
-        S_P_pred = torch.linalg.cholesky(P_delta_pred + 1e-4 * eye_n)
+    S_P_pred = safe_cholesky_fallback(P_delta_pred, eye_n, JITTER_TRIA)
     
     scaled_P = fv_cache.gamma_sigma * S_P_pred
     unified = fv_cache.unified_thetas
@@ -3258,10 +3338,7 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     
     # ── Kalman gain ─────────────────────────────────────────────────
     eye_batch = torch.eye(batch_sz, dtype=DTYPE, device=device)
-    try:
-        L_zz = torch.linalg.cholesky(P_zz + JITTER * eye_batch)
-    except Exception:
-        L_zz = torch.linalg.cholesky(P_zz + 1e-4 * eye_batch)
+    L_zz = safe_cholesky_fallback(P_zz, eye_batch)
     
     tmp = torch.linalg.solve_triangular(L_zz, P_delta_z.t(), upper=False)
     K_t = torch.linalg.solve_triangular(L_zz.t(), tmp, upper=True)
@@ -3749,10 +3826,7 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         all_P_pred = all_P_prev + Q_proc
         all_P_pred = 0.5 * (all_P_pred + all_P_pred.transpose(-1, -2))
         
-        try:
-            all_L_chol = torch.linalg.cholesky(all_P_pred + JITTER_TRIA * eye_grp)
-        except Exception:
-            all_L_chol = torch.linalg.cholesky(all_P_pred + 1e-4 * eye_grp)
+        all_L_chol = safe_cholesky_fallback(all_P_pred, eye_grp, JITTER_TRIA)
         
         scaled_P_g = grp['gamma'] * all_L_chol  # [num_in_grp, bs, bs]
         
@@ -3865,10 +3939,7 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         
         # Kalman gain via batched Cholesky
         eye_bs = torch.eye(batch_sz, dtype=DTYPE, device=device).unsqueeze(0).expand(nb, -1, -1)
-        try:
-            L_zz = torch.linalg.cholesky(P_zz + JITTER * eye_bs)
-        except Exception:
-            L_zz = torch.linalg.cholesky(P_zz + 1e-4 * eye_bs)
+        L_zz = safe_cholesky_fallback(P_zz, eye_bs)
         
         # K = P_xz @ P_zz⁻¹
         # K^T = (P_zz⁻¹)^T @ P_xz^T = P_zz⁻¹ @ P_xz^T (P_zz symmetric)
@@ -4061,10 +4132,7 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         all_P_pred = all_P_prev + Q_proc
         all_P_pred = 0.5 * (all_P_pred + all_P_pred.transpose(-1, -2))
         
-        try:
-            all_L_chol = torch.linalg.cholesky(all_P_pred + JITTER_TRIA * eye_grp)
-        except Exception:
-            all_L_chol = torch.linalg.cholesky(all_P_pred + 1e-4 * eye_grp)
+        all_L_chol = safe_cholesky_fallback(all_P_pred, eye_grp, JITTER_TRIA)
         
         scaled_P_g = grp['gamma'] * all_L_chol
         num_sigma_g = 2 * bs_val + 1
@@ -4147,10 +4215,7 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         P_zz = 0.5 * (P_zz + P_zz.transpose(-1, -2))
         
         eye_bs = torch.eye(batch_sz, dtype=DTYPE, device=device).unsqueeze(0).expand(nb, -1, -1)
-        try:
-            L_zz = torch.linalg.cholesky(P_zz + JITTER * eye_bs)
-        except Exception:
-            L_zz = torch.linalg.cholesky(P_zz + 1e-4 * eye_bs)
+        L_zz = safe_cholesky_fallback(P_zz, eye_bs)
         
         tmp = torch.linalg.solve_triangular(L_zz, P_xz.transpose(-1, -2), upper=False)
         K_t = torch.linalg.solve_triangular(L_zz.transpose(-1, -2), tmp, upper=True)
@@ -4536,6 +4601,12 @@ def train_srrhuif():
     
     method_title = f"{'D3QN' if cfg.use_dueling else 'DDQN'} + {cfg.decoupling_mode.upper()} Decoupled"
     
+    # ── 실제 작동 prior 선택 ──
+    #   state_form='error'이면 prior는 P_Δ⁻ = p_delta_init·I 로 시작하므로
+    #   로그에 p_init이 아니라 p_delta_init을 찍어야 한다 (p_init은 absolute 전용, error에선 dead value).
+    eff_prior = cfg.p_delta_init if cfg.state_form == 'error' else cfg.p_init
+    eff_prior_name = 'p_Δ_init' if cfg.state_form == 'error' else 'p_init'
+
     print(f"\n{'='*60}")
     form_short = "RHUKF" if cfg.filter_form == 'covariance' else "SRRHUIF"
     print(f"  {form_short}-{method_title} v6.0 Robust Session")
@@ -4543,7 +4614,7 @@ def train_srrhuif():
           f"| input_norm={'on' if (cfg.use_input_norm and cfg.obs_scale) else 'off'}")
     print(f"  Filter form: {cfg.filter_form} ({'Kim et al. 2010 Alg 1' if cfg.filter_form == 'covariance' else 'sqrt-information'})")
     print(f"  Horizon: {cfg.N_horizon} | Batch: {cfg.batch_size} | Params: {info['total_params']}")
-    print(f"  Settings: P_init={cfg.p_init}, Tikhonov={cfg.tikhonov_lambda}, Huber_c={cfg.huber_c}")
+    print(f"  Settings: {eff_prior_name}={eff_prior} (effective prior), Tikhonov={cfg.tikhonov_lambda}, Huber_c={cfg.huber_c}")
     print(f"  N-step: use={cfg.use_n_step}, size={cfg.n_step_size} "
           f"(target γ = {cfg.gamma ** cfg.n_step_size if cfg.use_n_step else cfg.gamma:.4f})")
     print(f"  Output Dir: {cfg.outdir}")
@@ -4685,8 +4756,10 @@ def train_srrhuif():
         last_h_k_traj, last_h_p_traj, last_h_ht_traj = [], [], []
         last_h_resid_traj, last_h_innov_decomp, last_h_cos_traj = [], [], []
         last_h_layer_ht, last_h_layer_delta = [], []
-        last_h_layer_resid_max = [] 
+        last_h_layer_resid_max = []
         last_h_layer_cond, last_h_layer_ymax = [], []
+        last_h_gain_traj, last_h_pos_traj, last_h_maxz_traj = [], [], []
+        last_h_layer_gain = []  # [probe] per-h × per-layer mean_gain dict 리스트
         last_ep_cos = None
         
         ep_cond_collect, ep_ymax_collect, ep_argmax_flips = {}, {}, []
@@ -4764,7 +4837,14 @@ def train_srrhuif():
                     h_innov_traj, h_cos_traj = [], []
                     h_layer_ht, h_layer_delta, h_layer_cond, h_layer_ymax = [], [], [], []
                     h_layer_resid_max = []
+                    h_gain_traj, h_pos_traj, h_maxz_traj = [], [], []  # [probe] per-h 집계
+                    h_layer_gain = []                                  # [probe] per-h × per-layer
                     prev_h_delta = None
+                    # [probe] Per-h activation regime 게이팅: 플래그 + cadence + warmup
+                    #   매 h forward가 추가되므로 반드시 게이팅 (throughput 보호).
+                    do_act_regime = (cfg.diag_act_regime
+                                     and ep >= cfg.act_regime_warmup
+                                     and (ep % max(cfg.act_regime_every, 1) == 0))
                     # [v5] q_next_caches 사전계산 제거 — 매 horizon step 내부에서 계산
                     
                     if cfg.diag_argmax_flip:
@@ -4863,9 +4943,22 @@ def train_srrhuif():
                         h_resid_traj.append(dbg['resid_norm']); h_resid_in_innov_traj.append(dbg['resid_in_innov'])
                         h_ht_theta_traj.append(dbg['ht_theta_in_innov']); h_innov_traj.append(dbg['innov_norm'])
                         h_layer_ht.append(dbg['per_layer_ht']); h_layer_delta.append(dbg['per_layer_delta'])
-                        h_layer_resid_max.append(dbg['per_layer_resid_max']) 
+                        h_layer_resid_max.append(dbg['per_layer_resid_max'])
                         h_layer_cond.append(dbg['per_layer_cond']); h_layer_ymax.append(dbg['per_layer_ymax'])
-                        
+
+                        # [probe] Per-h activation regime: 이 fold의 operating point(theta_before_h)에서
+                        #   batch_hist[h]['s']를 흘려 pre-activation regime + effective gain 측정.
+                        if do_act_regime:
+                            s_reg = batch_hist[h]['s']
+                            if normalizer: s_reg = normalizer.normalize(s_reg)
+                            reg = compute_act_regime(theta_before_h, info, s_reg, cfg.activation_fn)
+                            tot = reg['__total__']
+                            h_gain_traj.append(tot['mean_gain'])
+                            h_pos_traj.append(tot['frac_pos'])
+                            h_maxz_traj.append(tot['max_abs_z'])
+                            h_layer_gain.append({l: reg[l]['mean_gain']
+                                                 for l in reg if l != '__total__'})
+
                     if cfg.diag_argmax_flip:
                         with torch.no_grad():
                             argmax_after = forward_single(theta.squeeze(), info, s_flip).argmax(dim=0)
@@ -4899,10 +4992,13 @@ def train_srrhuif():
                     last_h_resid_traj, last_h_cos_traj = h_resid_traj, h_cos_traj
                     last_h_innov_decomp = list(zip(h_resid_in_innov_traj, h_ht_theta_traj, h_innov_traj))
                     last_h_layer_ht, last_h_layer_delta = h_layer_ht, h_layer_delta
-                    last_h_layer_resid_max = h_layer_resid_max 
+                    last_h_layer_resid_max = h_layer_resid_max
                     last_h_layer_cond, last_h_layer_ymax = h_layer_cond, h_layer_ymax
-                    
-                update_times.append(time.perf_counter() - update_start) 
+                    if do_act_regime:  # 프로브가 돈 horizon에서만 갱신 (off 에피소드엔 직전 값 유지)
+                        last_h_gain_traj, last_h_pos_traj, last_h_maxz_traj = h_gain_traj, h_pos_traj, h_maxz_traj
+                        last_h_layer_gain = h_layer_gain
+
+                update_times.append(time.perf_counter() - update_start)
 
             if done or trunc: break
 
@@ -4973,8 +5069,8 @@ def train_srrhuif():
             prefix_tag = "[RHUKF]" if is_rhukf else "[SRRHUIF]"
             
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
-                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | Q_std: {sp.get('current_q_std', cfg.q_init):.1e} | R_std: {sp.get('current_r_std', cfg.r_init):.1e} | P_avg: {avg_P_ep:.4f} (P0={cfg.p_init:.2f}) | K_Gain: {avg_k:.4f} "
-                  f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | Time: {time.time()-ep_start:.2f}s")
+                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | Q_std: {sp.get('current_q_std', cfg.q_init):.1e} | R_std: {sp.get('current_r_std', cfg.r_init):.1e} | P_avg: {avg_P_ep:.4f} (P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
+                  f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
 
             file_print(f"          └─▶ Innov (Mean / Max): [{avg_i_mean:.4f} / {max_i_max:.4f}]")
             
@@ -4990,6 +5086,16 @@ def train_srrhuif():
                     file_print(f"          └─▶ |innov|/h: {fmt([d[2] for d in last_h_innov_decomp])}")
                 if last_h_cos_traj:
                     file_print(f"          └─▶ cos(δ)/h:  {fmt2(last_h_cos_traj)}")
+                # [probe] Per-h activation regime: fold 따라 증가하면 runaway 시그니처
+                if last_h_gain_traj:
+                    fmt_pct = lambda traj: "[" + ", ".join([f"{100*v:.1f}%" for v in traj]) + "]"
+                    file_print(f"          └─▶ gain/h:    {fmt(last_h_gain_traj)}")
+                    file_print(f"          └─▶ pos%/h:    {fmt_pct(last_h_pos_traj)}")
+                    file_print(f"          └─▶ maxz/h:    {fmt(last_h_maxz_traj)}")
+                    if last_h_layer_gain:
+                        g_labels = sorted(last_h_layer_gain[0].keys())
+                        for h_idx in range(len(last_h_layer_gain)):
+                            file_print(f"          ├─▶ gain   h={h_idx}:  " + " ".join([f"{l}={last_h_layer_gain[h_idx][l]:.3f}" for l in g_labels]))
                 ep_cos_str = f"{last_ep_cos:+.3f}" if last_ep_cos is not None else "N/A"
                 file_print(f"          └─▶ ep_cos: {ep_cos_str} | θ-target drift: {target_drift:.4f} | ep_Δθ: {ep_delta_norm:.4f}")
                 
