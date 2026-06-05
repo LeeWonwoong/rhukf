@@ -289,15 +289,15 @@ class Config:
     network_seed: Optional[int] = 42
     env_seed: Optional[int] = 42
     
-    use_full_eigvalsh: bool = False
-    diag_ref_states: bool = False
+    use_full_eigvalsh: bool = True
+    diag_ref_states: bool = True
     diag_argmax_flip: bool = True
-    diag_eff_rank: bool = False
-    diag_horizon_cond: bool = False
+    diag_eff_rank: bool = True
+    diag_horizon_cond: bool = True
     diag_buffer: bool = True
     
     # [v9+] Activation health: hidden 레이어 포화/죽은 뉴런 모니터
-    diag_act_health: bool = False
+    diag_act_health: bool = True
     act_health_n_sample: int = 512   # 버퍼에서 뽑을 샘플 수
     act_health_sat_thresh: float = 0.95   # tanh/gelu 포화 임계 (|post| 평균)
     act_health_dead_thresh: float = 0.05  # 모든 활성화: 거의 0 출력 임계 (|post| 최대)
@@ -305,7 +305,7 @@ class Config:
     # [probe] Per-h activation regime + effective-gain (horizon 내부 fold-gain runaway 진단)
     #   붕괴 시그니처: 한 horizon 안에서 mean_gain/frac_pos가 fold(h) 따라 증가
     #   (건강하면 flat/감소). 매 h마다 forward가 추가되므로 반드시 cadence 게이팅.
-    diag_act_regime: bool = False
+    diag_act_regime: bool = True
     act_regime_every: int = 5     # N 에피소드마다만 프로브 (1이면 매 에피소드)
     act_regime_warmup: int = 0    # 이 에피소드 이후부터만 프로브 (후반 phase 집중용)
     save_file_log: bool = True
