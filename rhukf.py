@@ -127,7 +127,7 @@ ENV_CONFIGS: Dict[str, Dict] = {
     "CartPole-v1": {
         "obs_scale": [2.4, 3.0, 0.21, 2.0],
         "max_steps": 500,
-        "max_episodes": 120,
+        "max_episodes": 150,
         "eps_decay_steps": 2000,
         "buffer_size": 50000,
         "results_dir": "results_cartpole",
