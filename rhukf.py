@@ -273,7 +273,7 @@ class Config:
     #   'init'   = 학습 시작시 frozen된 θ_init (RHE/FIR 정신에 더 가까움)
     h0_prior_source: str = 'target'
     
-    shared_layers: List[int] = field(default_factory=lambda: [24,24])   # [] = no hidden shared layers
+    shared_layers: List[int] = field(default_factory=lambda: [32,32])   # [] = no hidden shared layers
     value_layers: List[int] = field(default_factory=lambda: [])
     advantage_layers: List[int] = field(default_factory=lambda: [])
     q_layers: List[int] = field(default_factory=lambda: [])        # [] = sing le linear layer (dimS → nA)
@@ -293,30 +293,29 @@ class Config:
     init_scheme: str = 'he' #xavier
 
     buffer_size: int = 50000
-    batch_size: int = 128
+    batch_size: int = 256
     N_horizon: int = 6
     
     q_init: float = 1e-2
     q_end: float = 1e-2
 
-    r_init: float = 1.5
-    r_end: float = 1.5
+    r_init: float = 1.0
+    r_end: float = 1.0
     huber_c: float = 1000
     
     tikhonov_lambda: float = 1e-8
 
     p_init: float = 0.05
-    p_delta_init: float = 0.05
+    p_delta_init: float = 0.03
     
-    alpha: float = 0.1
-
+    alpha: float = 0.3
     beta: float = 2.0
     kappa: float = 0.0
     
     use_n_step: bool = True
     n_step_size: int = 3
 
-    use_per: bool = True
+    use_per: bool = False
     per_alpha: float = 0.6      # priority 지수 (Schaul 2016 기본값)
     per_eps: float = 1e-6       # 0 priority 방지용 offset
     # [IS-R] IS-weight를 측정 노이즈 R 변조로 반영 (2차 최적화기용 bias 보정).
@@ -4322,11 +4321,12 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
     new_theta_dict = {}
     total_loss = 0.0
     layer_count = info['num_filter_layers']
-    total_innov_mean = total_innov_max = total_k_norm = 0.0
-    total_ht_norm = total_resid_norm = total_avg_P = 0.0
-    per_layer_ht_dict, per_layer_delta_dict, per_layer_resid_max_dict = {}, {}, {}
-    per_layer_cond, per_layer_ymax = {}, {}
-    
+    # [opt] 진단 스칼라는 루프 내 .item() GPU 동기화(33s 주범)를 피하려고 0-dim 텐서로 모았다가
+    #   루프 종료 후 1회만 변환한다. (수학 불변)
+    _labels, _ht_t, _kn_t, _resid_t, _deltac_t = [], [], [], [], []
+    _innovmean_t, _innovmax_t, _avgP_t = [], [], []
+    z_abs_max = torch.max(torch.abs(z_measured)).item()  # 레이어 무관 → 1회만
+
     for L in range(info['num_filter_layers']):
         pl = per_layer[L]
         lc, fl = pl['lc'], pl['fl']
@@ -4388,11 +4388,10 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         delta_theta = torch.einsum('bpj,bj->bp', K, residual)  # [num_blocks, param_len]
         theta_new_block = theta_pred_block.squeeze(-1) + delta_theta
         
-        # NaN check
-        invalid = ~torch.isfinite(theta_new_block).all(dim=1)
-        if invalid.any():
-            theta_new_block[invalid] = theta_pred_block.squeeze(-1)[invalid]
-        
+        # NaN 가드: .any() 동기화 없이 torch.where (sync-free)
+        finite_mask = torch.isfinite(theta_new_block).all(dim=1, keepdim=True)
+        theta_new_block = torch.where(finite_mask, theta_new_block, theta_pred_block.squeeze(-1))
+
         # Covariance update: P_new = P_pred - K @ P_zz @ K^T = P_pred - (K L_zz)(K L_zz)^T
         K_L = torch.bmm(K, L_zz)  # [num_blocks, param_len, batch_sz]
         P_new = pl['P_pred'] - torch.bmm(K_L, K_L.transpose(-1, -2))
@@ -4400,31 +4399,44 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         if cfg.tikhonov_lambda > 0:
             eye_p = lc['eye_block_batch']
             P_new = P_new + cfg.tikhonov_lambda * eye_p
-        
+
         new_P_dict[L] = P_new
         new_theta_dict[L] = theta_new_block
-        
-        # Loss & diagnostics
-        loss_L = torch.mean(residual ** 2)
-        total_loss += loss_L
-        ht_norm = torch.norm(P_xz).item()
-        resid_norm = torch.norm(residual).item()
-        k_norm = torch.norm(K).item()
-        
-        total_innov_mean += res_abs.mean().item()
-        total_innov_max = max(total_innov_max, res_abs.max().item())
-        total_k_norm += k_norm
-        total_ht_norm += ht_norm
-        total_resid_norm += resid_norm
-        total_avg_P += torch.diagonal(P_new, dim1=-2, dim2=-1).mean().item()
-        
-        label = f"{fl['type'][0].upper()}{fl['local_idx']}"
-        per_layer_ht_dict[label] = ht_norm
-        per_layer_resid_max_dict[label] = res_abs.max().item()
-        per_layer_delta_dict[label] = torch.norm(delta_theta).item()
-        per_layer_cond[label] = 1.0
-        per_layer_ymax[label] = torch.max(torch.abs(z_measured)).item()
-    
+
+        total_loss = total_loss + torch.mean(residual ** 2)
+
+        # [opt] 진단: 0-dim 텐서로만 누적 (.item() 호출 없음 → GPU sync 없음)
+        _labels.append(f"{fl['type'][0].upper()}{fl['local_idx']}")
+        _ht_t.append(torch.norm(P_xz))
+        _kn_t.append(torch.norm(K))
+        _deltac_t.append(torch.norm(delta_theta))
+        _resid_t.append(torch.norm(residual))
+        _innovmean_t.append(res_abs.mean())
+        _innovmax_t.append(res_abs.max())
+        _avgP_t.append(torch.diagonal(P_new, dim1=-2, dim2=-1).mean())
+
+    # [opt] 진단 스칼라 1회 변환 (레이어당 ~7 sync → 메트릭당 1 sync)
+    ht_v = torch.stack(_ht_t).tolist()
+    kn_v = torch.stack(_kn_t).tolist()
+    deltac_v = torch.stack(_deltac_t).tolist()
+    resid_v = torch.stack(_resid_t).tolist()
+    innovmean_v = torch.stack(_innovmean_t).tolist()
+    innovmax_v = torch.stack(_innovmax_t).tolist()
+    avgP_v = torch.stack(_avgP_t).tolist()
+
+    total_innov_mean = float(np.sum(innovmean_v))
+    total_innov_max = float(np.max(innovmax_v))
+    total_k_norm = float(np.sum(kn_v))
+    total_ht_norm = float(np.sum(ht_v))
+    total_resid_norm = float(np.sum(resid_v))
+    total_avg_P = float(np.sum(avgP_v))
+
+    per_layer_ht_dict = {l: v for l, v in zip(_labels, ht_v)}
+    per_layer_resid_max_dict = {l: v for l, v in zip(_labels, innovmax_v)}
+    per_layer_delta_dict = {l: v for l, v in zip(_labels, deltac_v)}
+    per_layer_cond = {l: 1.0 for l in _labels}
+    per_layer_ymax = {l: z_abs_max for l in _labels}
+
     # ── Compose final θ ──
     theta_new_flat = theta_current_in.squeeze().clone()
     for L in range(info['num_filter_layers']):
@@ -4613,11 +4625,12 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
     new_mu_delta_dict = {}
     total_loss = 0.0
     layer_count = info['num_filter_layers']
-    total_innov_mean = total_innov_max = total_k_norm = 0.0
-    total_ht_norm = total_resid_norm = total_avg_P = 0.0
-    per_layer_ht_dict, per_layer_delta_dict, per_layer_resid_max_dict = {}, {}, {}
-    per_layer_cond, per_layer_ymax = {}, {}
-    
+    # [opt] 진단 스칼라는 루프 내 .item() GPU 동기화 폭탄(33s 주범)을 피하려고 0-dim 텐서로
+    #   모았다가 루프 종료 후 1회만 .tolist()로 변환한다. (수학은 불변)
+    _labels, _ht_t, _kn_t, _resid_t, _deltac_t = [], [], [], [], []
+    _innovmean_t, _innovmax_t, _avgP_t = [], [], []
+    z_abs_max = torch.max(torch.abs(z_measured)).item()  # 레이어 무관 → 1회만
+
     for L in range(info['num_filter_layers']):
         pl = per_layer[L]
         lc, fl = pl['lc'], pl['fl']
@@ -4662,40 +4675,53 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         delta_correction = torch.einsum('bpj,bj->bp', K, residual)
         mu_delta_new_block = mu_delta_prev_block + delta_correction
         
-        invalid = ~torch.isfinite(mu_delta_new_block).all(dim=1)
-        if invalid.any():
-            mu_delta_new_block[invalid] = mu_delta_prev_block[invalid]
-        
+        # NaN 가드: .any() 동기화 없이 torch.where (sync-free)
+        finite_mask = torch.isfinite(mu_delta_new_block).all(dim=1, keepdim=True)
+        mu_delta_new_block = torch.where(finite_mask, mu_delta_new_block, mu_delta_prev_block)
+
         K_L = torch.bmm(K, L_zz)
         P_new = pl['P_pred'] - torch.bmm(K_L, K_L.transpose(-1, -2))
         P_new = 0.5 * (P_new + P_new.transpose(-1, -2))
         if cfg.tikhonov_lambda > 0:
             P_new = P_new + cfg.tikhonov_lambda * lc['eye_block_batch']
-        
+
         new_P_dict[L] = P_new
         new_mu_delta_dict[L] = mu_delta_new_block
-        
-        loss_L = torch.mean(residual ** 2)
-        total_loss += loss_L
-        
-        ht_norm = torch.norm(P_xz).item()
-        k_norm = torch.norm(K).item()
-        delta_change_norm = torch.norm(delta_correction).item()
-        
-        total_innov_mean += res_abs.mean().item()
-        total_innov_max = max(total_innov_max, res_abs.max().item())
-        total_k_norm += k_norm
-        total_ht_norm += ht_norm
-        total_resid_norm += torch.norm(residual).item()
-        total_avg_P += torch.diagonal(P_new, dim1=-2, dim2=-1).mean().item()
-        
-        label = f"{fl['type'][0].upper()}{fl['local_idx']}"
-        per_layer_ht_dict[label] = ht_norm
-        per_layer_resid_max_dict[label] = res_abs.max().item()
-        per_layer_delta_dict[label] = delta_change_norm
-        per_layer_cond[label] = 1.0
-        per_layer_ymax[label] = torch.max(torch.abs(z_measured)).item()
-    
+
+        total_loss = total_loss + torch.mean(residual ** 2)
+
+        # [opt] 진단: 0-dim 텐서로만 누적 (.item() 호출 없음 → GPU sync 없음)
+        _labels.append(f"{fl['type'][0].upper()}{fl['local_idx']}")
+        _ht_t.append(torch.norm(P_xz))
+        _kn_t.append(torch.norm(K))
+        _deltac_t.append(torch.norm(delta_correction))
+        _resid_t.append(torch.norm(residual))
+        _innovmean_t.append(res_abs.mean())
+        _innovmax_t.append(res_abs.max())
+        _avgP_t.append(torch.diagonal(P_new, dim1=-2, dim2=-1).mean())
+
+    # [opt] 진단 스칼라 1회 변환 (레이어당 ~7 sync → 메트릭당 1 sync로 축소)
+    ht_v = torch.stack(_ht_t).tolist()
+    kn_v = torch.stack(_kn_t).tolist()
+    deltac_v = torch.stack(_deltac_t).tolist()
+    resid_v = torch.stack(_resid_t).tolist()
+    innovmean_v = torch.stack(_innovmean_t).tolist()
+    innovmax_v = torch.stack(_innovmax_t).tolist()
+    avgP_v = torch.stack(_avgP_t).tolist()
+
+    total_innov_mean = float(np.sum(innovmean_v))
+    total_innov_max = float(np.max(innovmax_v))
+    total_k_norm = float(np.sum(kn_v))
+    total_ht_norm = float(np.sum(ht_v))
+    total_resid_norm = float(np.sum(resid_v))
+    total_avg_P = float(np.sum(avgP_v))
+
+    per_layer_ht_dict = {l: v for l, v in zip(_labels, ht_v)}
+    per_layer_resid_max_dict = {l: v for l, v in zip(_labels, innovmax_v)}
+    per_layer_delta_dict = {l: v for l, v in zip(_labels, deltac_v)}
+    per_layer_cond = {l: 1.0 for l in _labels}
+    per_layer_ymax = {l: z_abs_max for l in _labels}
+
     # Compose final θ_active
     new_mu_delta_per_L = [new_mu_delta_dict[L] for L in range(info['num_filter_layers'])]
     theta_active_flat = _compose_theta_from_delta(
