@@ -211,12 +211,6 @@ class Config:
     # [TF32] NN forward(matmul/bmm)만 TF32 허용, 필터 행렬연산은 FP32 유지.
     #   Ampere+ (compute capability ≥ 8.0) GPU에서만 실제로 효과. CPU/구형 GPU면 무시(FP32).
     use_tf32_forward: bool = True
-
-    # [torch.compile] forward 함수(forward_bmm/single/with_shared)만 compile.
-    #   기본 OFF. 켜도 환경 미지원/런타임 실패 시 자동 eager 폴백(무시).
-    #   FV forward_bmm은 정적 shape라 reduce-overhead(CUDA graphs) 권장(기본).
-    use_compile: bool = False
-    compile_mode: str = 'reduce-overhead'  # 'default' | 'reduce-overhead' | 'max-autotune'
     max_episodes: int = 200
     max_steps: int = 500
 
@@ -629,13 +623,6 @@ parser.add_argument('--tf32_forward', dest='use_tf32_forward', action='store_tru
                     help="NN forward(matmul)만 TF32 허용 (Ampere+ GPU에서만 효과). 행렬연산은 FP32.")
 parser.add_argument('--no_tf32_forward', dest='use_tf32_forward', action='store_false',
                     help="forward도 FP32로 (TF32 완전 비활성)")
-parser.add_argument('--compile', dest='use_compile', action='store_true', default=cfg.use_compile,
-                    help="forward 함수 torch.compile (호환 안 되면 자동 eager 폴백)")
-parser.add_argument('--no_compile', dest='use_compile', action='store_false',
-                    help="torch.compile 비활성 (eager)")
-parser.add_argument('--compile_mode', type=str, default=cfg.compile_mode,
-                    choices=['default', 'reduce-overhead', 'max-autotune'],
-                    help="torch.compile 모드 (default %(default)s; FV 정적 shape엔 reduce-overhead 권장)")
 parser.add_argument('--record_video', action='store_true', default=cfg.record_video,
                     help="매 --video_interval 에피소드마다 greedy rollout을 headless mp4로 녹화")
 parser.add_argument('--video_interval', type=int, default=cfg.video_interval,
@@ -756,8 +743,6 @@ cfg.enable_wind = args.enable_wind
 cfg.wind_power = args.wind_power
 cfg.turbulence_power = args.turbulence_power
 cfg.use_tf32_forward = args.use_tf32_forward
-cfg.use_compile = args.use_compile
-cfg.compile_mode = args.compile_mode
 if args.max_steps is not None:
     cfg.max_steps = args.max_steps
     cfg._max_steps_explicit = True
@@ -836,7 +821,6 @@ cfg.__post_init__()
 _tf32_on, _tf32_sup = apply_tf32_config(cfg)
 print(f"[TF32] forward TF32 = {'ON' if _tf32_on else 'off'} "
       f"(요청={cfg.use_tf32_forward}, GPU 지원={'yes' if _tf32_sup else 'no'}) | 행렬연산은 FP32 유지")
-# torch.compile 적용은 forward impl/apply_compile_config 정의 이후로 미룸 (아래 forward 섹션 끝)
 
 # =========================================================================
 # 2. Network Info & Unified Cache
@@ -1021,7 +1005,8 @@ def _get_act_fn(name: str):
         raise ValueError(f"Unknown activation_fn: {name}")
 
 
-def _forward_single_impl(theta, info, x):
+@tf32_forward
+def forward_single(theta, info, x):
     theta = theta.to(DTYPE_FWD)
     if theta.dim() == 2: theta = theta.squeeze()
     x = x.to(DTYPE_FWD)
@@ -1076,7 +1061,8 @@ def _forward_single_impl(theta, info, x):
     else:
         return a.to(DTYPE)
 
-def _forward_single_with_shared_impl(theta, info, x):
+@tf32_forward
+def forward_single_with_shared(theta, info, x):
     theta = theta.to(DTYPE_FWD)
     if theta.dim() == 2: theta = theta.squeeze()
     x = x.to(DTYPE_FWD)
@@ -1134,7 +1120,8 @@ def _forward_single_with_shared_impl(theta, info, x):
         Q = a.to(DTYPE)
     return Q, shared_out.to(DTYPE)
 
-def _forward_bmm_impl(thetas, info, x):
+@tf32_forward
+def forward_bmm(thetas, info, x):
     thetas = thetas.to(DTYPE_FWD); x = x.to(DTYPE_FWD)
     num_sigma = thetas.shape[0]
     use_resid = info.get('use_residual', False)
@@ -1188,76 +1175,6 @@ def _forward_bmm_impl(thetas, info, x):
         return (v + (a - a.mean(dim=1, keepdim=True))).to(DTYPE)
     else:
         return a.to(DTYPE)
-
-
-# =========================================================================
-# torch.compile (forward 전용, 설정형) — TF32(바깥) + compile(raw impl 안쪽) 합성
-#   FV forward_bmm은 정적 shape라 reduce-overhead(CUDA graphs) 적합(기본 mode).
-#   forward_single은 shape 2종(단일/배치) → reduce-overhead면 소수 graph 캡처(허용).
-#   켰는데 환경이 호환 안 되면(첫 호출 실패) 자동 eager 폴백 → use_compile=True도 안전.
-# =========================================================================
-_COMPILED: Dict = {}  # 'bmm'/'single'/'shared' → torch.compile된 impl (없으면 eager)
-
-def apply_compile_config(cfg):
-    """cfg.use_compile + CUDA 지원 시 forward impl 3개를 torch.compile로 등록.
-    (torch.compile은 지연 컴파일이라 실제 컴파일 실패는 호출부 try/except에서 처리.)"""
-    global _COMPILED
-    _COMPILED = {}
-    if not getattr(cfg, 'use_compile', False) or not torch.cuda.is_available():
-        return False
-    try:
-        mode = getattr(cfg, 'compile_mode', 'reduce-overhead')
-        _COMPILED['bmm'] = torch.compile(_forward_bmm_impl, mode=mode)
-        _COMPILED['single'] = torch.compile(_forward_single_impl, mode=mode)
-        _COMPILED['shared'] = torch.compile(_forward_single_with_shared_impl, mode=mode)
-        return True
-    except Exception as e:
-        print(f"[compile] torch.compile 등록 실패 → eager 사용: {type(e).__name__}: {e}")
-        _COMPILED = {}
-        return False
-
-
-@tf32_forward
-def forward_single(theta, info, x):
-    fn = _COMPILED.get('single')
-    if fn is not None:
-        try:
-            return fn(theta, info, x)
-        except Exception as e:
-            print(f"[compile] forward_single 런타임 실패 → eager 폴백: {type(e).__name__}: {e}")
-            _COMPILED.pop('single', None)
-    return _forward_single_impl(theta, info, x)
-
-
-@tf32_forward
-def forward_single_with_shared(theta, info, x):
-    fn = _COMPILED.get('shared')
-    if fn is not None:
-        try:
-            return fn(theta, info, x)
-        except Exception as e:
-            print(f"[compile] forward_single_with_shared 런타임 실패 → eager 폴백: {type(e).__name__}: {e}")
-            _COMPILED.pop('shared', None)
-    return _forward_single_with_shared_impl(theta, info, x)
-
-
-@tf32_forward
-def forward_bmm(thetas, info, x):
-    fn = _COMPILED.get('bmm')
-    if fn is not None:
-        try:
-            return fn(thetas, info, x)
-        except Exception as e:
-            print(f"[compile] forward_bmm 런타임 실패 → eager 폴백: {type(e).__name__}: {e}")
-            _COMPILED.pop('bmm', None)
-    return _forward_bmm_impl(thetas, info, x)
-
-
-# ── torch.compile 정책 적용 (impl/apply_compile_config 정의 직후, cfg는 이미 확정됨) ──
-_compile_on = apply_compile_config(cfg)
-print(f"[compile] use_compile = {'ON' if _compile_on else 'off'} "
-      f"(요청={cfg.use_compile}, mode={cfg.compile_mode}, CUDA={'yes' if torch.cuda.is_available() else 'no'})")
-
 
 class TensorReplayBuffer:
     """
@@ -4388,10 +4305,10 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         Wc_col = lc['Wc_f32'].to(DTYPE).view(1, -1, 1)  # [1, num_sigma, 1]
         
         # P_zz = Σ Wc (Z-z̄)(Z-z̄)^T per block
-        P_zz_sigma = torch.bmm((Wc_col * Z_dev).transpose(1, 2), Z_dev)  # [num_blocks, bs_sz, bs_sz]
+        P_zz_sigma = torch.einsum('bsj,bsi->bji', Wc_col * Z_dev, Z_dev)  # [num_blocks, bs_sz, bs_sz]
         
         # P_xz = Σ Wc (X-x̄)(Z-z̄)^T per block
-        P_xz = torch.bmm((Wc_col * X_dev).transpose(1, 2), Z_dev)  # [num_blocks, param_len, batch_sz]
+        P_xz = torch.einsum('bsp,bsj->bpj', Wc_col * X_dev, Z_dev)  # [num_blocks, param_len, batch_sz]
         
         # Huber-adaptive R
         res_abs = torch.abs(residual)  # [num_blocks, batch_sz]
@@ -4414,7 +4331,7 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         
         # State update per block
         theta_pred_block = pl['theta_3d']  # [num_blocks, param_len, 1]
-        delta_theta = torch.bmm(K, residual.unsqueeze(-1)).squeeze(-1)  # [num_blocks, param_len]
+        delta_theta = torch.einsum('bpj,bj->bp', K, residual)  # [num_blocks, param_len]
         theta_new_block = theta_pred_block.squeeze(-1) + delta_theta
         
         # NaN check
@@ -4668,8 +4585,8 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         X_dev[:, plen+1:, :] = -scaled_P_T
         
         Wc_col = lc['Wc_f32'].to(DTYPE).view(1, -1, 1)
-        P_zz_sigma = torch.bmm((Wc_col * Z_dev).transpose(1, 2), Z_dev)
-        P_xz = torch.bmm((Wc_col * X_dev).transpose(1, 2), Z_dev)
+        P_zz_sigma = torch.einsum('bsj,bsi->bji', Wc_col * Z_dev, Z_dev)
+        P_xz = torch.einsum('bsp,bsj->bpj', Wc_col * X_dev, Z_dev)
         
         res_abs = torch.abs(residual)
         adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)
@@ -4688,7 +4605,7 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         
         # Δμ update: Δμ_new = Δμ_prev + K · residual
         mu_delta_prev_block = pl['mu_delta_3d'].squeeze(-1)
-        delta_correction = torch.bmm(K, residual.unsqueeze(-1)).squeeze(-1)
+        delta_correction = torch.einsum('bpj,bj->bp', K, residual)
         mu_delta_new_block = mu_delta_prev_block + delta_correction
         
         invalid = ~torch.isfinite(mu_delta_new_block).all(dim=1)
@@ -5060,7 +4977,6 @@ def train_srrhuif():
     env_seed = cfg.env_seed if cfg.env_seed is not None else cfg.seed
     set_all_seeds(net_seed)
     apply_tf32_config(cfg)  # cfg가 코드에서 바뀐 경우에도 반영 (idempotent)
-    apply_compile_config(cfg)
     env = gym.make(cfg.env_name, **build_env_kwargs(cfg))
     env.action_space.seed(net_seed)
     dimS, nA = env.observation_space.shape[0], env.action_space.n
@@ -5714,7 +5630,6 @@ def train_adam():
     env_seed = cfg.env_seed if cfg.env_seed is not None else cfg.seed
     set_all_seeds(net_seed)
     apply_tf32_config(cfg)  # cfg가 코드에서 바뀐 경우에도 반영 (idempotent)
-    apply_compile_config(cfg)
     env = gym.make(cfg.env_name, **build_env_kwargs(cfg))
     env.action_space.seed(net_seed)
     dimS, nA = env.observation_space.shape[0], env.action_space.n
