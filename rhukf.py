@@ -15,6 +15,7 @@ import random
 import argparse
 import warnings
 import math
+import functools
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 matplotlib.use('Agg')
@@ -83,10 +84,51 @@ print("=" * 70)
 print(f"SRRHUIF/RHUKF v9.0 (Error/Absolute state | FV/Node/Layer | FiMos 제거) | PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"Device: {torch.cuda.get_device_name(0)}")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
+    # TF32는 여기서 전역으로 켜지 않는다 — apply_tf32_config()가 cfg를 보고
+    # NN forward 전용으로만 활성화하고, 행렬연산(필터 공분산 bmm)은 FP32로 남긴다.
 print("=" * 70)
+
+# =========================================================================
+# TF32 분리: NN forward만 TF32 matmul, 필터 행렬연산은 FP32
+#   - TF32는 Ampere+ (compute capability ≥ 8.0) GPU의 float32 matmul/bmm에만 적용.
+#   - torch.linalg 분해(cholesky/qr/solve_triangular)는 이 플래그와 무관하게 FP32
+#     → 필터의 분해는 항상 안전. 분리 대상은 matmul/bmm 정밀도뿐.
+#   - 전역 기본은 FP32(allow_tf32=False). forward 함수만 데코레이터로 호출 동안 TF32 on.
+# =========================================================================
+TF32_FORWARD_ENABLED = False  # apply_tf32_config()에서 cfg + 하드웨어 보고 확정
+
+def _tf32_supported() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
+
+def apply_tf32_config(cfg):
+    """전역 matmul을 FP32로 고정하고, GPU 지원 + cfg.use_tf32_forward일 때만 forward TF32 활성.
+    Returns (enabled: bool, supported: bool)."""
+    global TF32_FORWARD_ENABLED
+    supported = _tf32_supported()
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    TF32_FORWARD_ENABLED = bool(getattr(cfg, 'use_tf32_forward', True) and supported)
+    return TF32_FORWARD_ENABLED, supported
+
+def tf32_forward(fn):
+    """NN forward 함수 데코레이터: 호출 동안만 TF32 matmul 허용(활성 시), 종료 시 원복.
+    비활성/미지원이면 완전 no-op(오버헤드 없음)이라 항상 붙여둬도 안전."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not TF32_FORWARD_ENABLED:
+            return fn(*args, **kwargs)
+        prev_mm = torch.backends.cuda.matmul.allow_tf32
+        prev_cudnn = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_mm
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
+    return wrapper
 
 def set_all_seeds(seed: int):
     torch.manual_seed(seed)
@@ -100,7 +142,7 @@ torch.set_default_dtype(torch.float32)
 DTYPE = torch.float32
 DTYPE_FWD = torch.float32
 JITTER = 1e-7
-JITTER_TRIA = 1e-6
+JITTER_TRIA = 1e-7
 
 # ── Fallback 발동 횟수 카운터 (수치적 안정성 진단용) ──
 #   chol_1e5: Cholesky(1e-6 jitter) 실패 → 1e-5 jitter 재시도 횟수
@@ -147,6 +189,17 @@ ENV_CONFIGS: Dict[str, Dict] = {
     },
 }
 
+
+def build_env_kwargs(cfg) -> Dict:
+    """env별 gym.make 추가 kwargs. LunarLander 계열에만 wind 파라미터 적용.
+    (CartPole 등 다른 env에 enable_wind를 넘기면 gym이 에러내므로 env 이름으로 분기)."""
+    kwargs: Dict = {}
+    if cfg.env_name.startswith("LunarLander"):
+        kwargs['enable_wind'] = cfg.enable_wind
+        kwargs['wind_power'] = cfg.wind_power
+        kwargs['turbulence_power'] = cfg.turbulence_power
+    return kwargs
+
 # ========================================================================
 # 1. Configuration
 # =========================================================================
@@ -154,6 +207,10 @@ ENV_CONFIGS: Dict[str, Dict] = {
 class Config:
     env_name: str = "CartPole-v1"  #"LunarLander-v3"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # [TF32] NN forward(matmul/bmm)만 TF32 허용, 필터 행렬연산은 FP32 유지.
+    #   Ampere+ (compute capability ≥ 8.0) GPU에서만 실제로 효과. CPU/구형 GPU면 무시(FP32).
+    use_tf32_forward: bool = True
     max_episodes: int = 200
     max_steps: int = 500
 
@@ -166,6 +223,12 @@ class Config:
     _max_episodes_explicit: bool = False  # --episodes로 직접 지정 시 env 기본값이 덮어쓰지 않도록
     _eps_decay_steps_explicit: bool = False  # --eps_decay_steps로 직접 지정 시 env 기본값이 덮어쓰지 않도록
     _buffer_size_explicit: bool = False  # --buffer로 직접 지정 시 env 기본값이 덮어쓰지 않도록
+
+    # [LunarLander-v3 wind] gym.make에 전달되는 바람 옵션. LunarLander 계열에만 적용됨
+    #   (build_env_kwargs 참조). enable_wind=False면 wind_power/turbulence_power는 무시.
+    enable_wind: bool = False
+    wind_power: float = 15.0        # gym 기본값 15.0 (권장 0.0~20.0)
+    turbulence_power: float = 1.5   # gym 기본값 1.5 (권장 0.0~2.0)
 
 
     # Decoupling Mode 
@@ -319,7 +382,7 @@ class Config:
     # [analysis] 로그 핵심원인 진단(VERDICT) + verbosity gating
     #   'auto'   = 콘솔에 요약(VERDICT/culprit/trend)만, 룰 발동 시에만 파일에 풀 덤프
     #   'always' = 기존 풀 덤프 유지 (요약은 위에 추가) / 'summary' = 요약만, 풀 덤프 항상 숨김
-    diag_log_mode: str = 'auto'
+    diag_log_mode: str = 'always'
     collapse_amp_thresh: float = 1.0   # sigma-spread amp 이 값 초과 + 증가 → RUNAWAY
     cond_warn: float = 1e6             # cond(P_zz/Y) 경고
     dead_warn: float = 0.3             # dead 뉴런 비율 경고
@@ -508,6 +571,9 @@ class Config:
         per_tag = f"_PER{self.per_alpha}" if self.use_per else ""
         # [v9+] Adam warm-up tag
         adam_tag = f"_adam{self.adam_lr:g}" if self.use_adam_warmup else ""
+        # [LunarLander wind] wind 켜면 결과가 섞이지 않도록 태그 추가
+        wind_tag = (f"_wind{self.wind_power:g}t{self.turbulence_power:g}"
+                    if (self.enable_wind and self.env_name.startswith("LunarLander")) else "")
         # [v9+] Train mode tag (filter는 생략, adam은 명시)
         if self.train_mode == 'adam':
             # Adam은 항상 q_target form만 사용 → meas_tag는 폴더명에 포함 안 함
@@ -517,7 +583,7 @@ class Config:
             )
         else:
             self.param_str = (
-                f"{self.decoupling_mode}_{form_str}_{state_tag}_{meas_tag}{per_tag}{adam_tag}_{duel_str}_{self.init_scheme}_"
+                f"{self.decoupling_mode}_{form_str}_{state_tag}_{meas_tag}{per_tag}{adam_tag}{wind_tag}_{duel_str}_{self.init_scheme}_"
                 f"h0_{self.h0_prior_source}_a{self.alpha}_r{self.r_init}_"
                 f"p{self.p_init}_pd{self.p_delta_init}_b{self.batch_size}_{nstep_str}_s{self.network_seed}"
             )
@@ -545,6 +611,18 @@ parser.add_argument('--env', type=str, default=cfg.env_name,
                          f"(미등록 환경은 obs_scale=None → --no... 정규화 주의)")
 parser.add_argument('--max_steps', type=int, default=None,
                     help="에피소드당 최대 스텝. 미지정 시 ENV_CONFIGS의 env 기본값 사용.")
+parser.add_argument('--enable_wind', dest='enable_wind', action='store_true', default=cfg.enable_wind,
+                    help="[LunarLander-v3] 바람 활성화 (gym.make(enable_wind=True))")
+parser.add_argument('--no_wind', dest='enable_wind', action='store_false',
+                    help="[LunarLander-v3] 바람 비활성화")
+parser.add_argument('--wind_power', type=float, default=cfg.wind_power,
+                    help="[LunarLander-v3] 바람 세기 (gym 기본 %(default)s, 권장 0~20)")
+parser.add_argument('--turbulence_power', type=float, default=cfg.turbulence_power,
+                    help="[LunarLander-v3] 난기류 세기 (gym 기본 %(default)s, 권장 0~2)")
+parser.add_argument('--tf32_forward', dest='use_tf32_forward', action='store_true', default=cfg.use_tf32_forward,
+                    help="NN forward(matmul)만 TF32 허용 (Ampere+ GPU에서만 효과). 행렬연산은 FP32.")
+parser.add_argument('--no_tf32_forward', dest='use_tf32_forward', action='store_false',
+                    help="forward도 FP32로 (TF32 완전 비활성)")
 parser.add_argument('--record_video', action='store_true', default=cfg.record_video,
                     help="매 --video_interval 에피소드마다 greedy rollout을 headless mp4로 녹화")
 parser.add_argument('--video_interval', type=int, default=cfg.video_interval,
@@ -661,6 +739,10 @@ parser.add_argument('--adam_lr', type=float, default=cfg.adam_lr,
 args, _ = parser.parse_known_args()
 
 cfg.env_name = args.env
+cfg.enable_wind = args.enable_wind
+cfg.wind_power = args.wind_power
+cfg.turbulence_power = args.turbulence_power
+cfg.use_tf32_forward = args.use_tf32_forward
 if args.max_steps is not None:
     cfg.max_steps = args.max_steps
     cfg._max_steps_explicit = True
@@ -734,6 +816,11 @@ if args.advantage_layers is not None:
 if args.q_layers is not None:
     cfg.q_layers = args.q_layers
 cfg.__post_init__()
+
+# ── TF32 정책 적용 (전역 FP32 고정 + GPU 지원 시 forward만 TF32) ──
+_tf32_on, _tf32_sup = apply_tf32_config(cfg)
+print(f"[TF32] forward TF32 = {'ON' if _tf32_on else 'off'} "
+      f"(요청={cfg.use_tf32_forward}, GPU 지원={'yes' if _tf32_sup else 'no'}) | 행렬연산은 FP32 유지")
 
 # =========================================================================
 # 2. Network Info & Unified Cache
@@ -918,6 +1005,7 @@ def _get_act_fn(name: str):
         raise ValueError(f"Unknown activation_fn: {name}")
 
 
+@tf32_forward
 def forward_single(theta, info, x):
     theta = theta.to(DTYPE_FWD)
     if theta.dim() == 2: theta = theta.squeeze()
@@ -973,6 +1061,7 @@ def forward_single(theta, info, x):
     else:
         return a.to(DTYPE)
 
+@tf32_forward
 def forward_single_with_shared(theta, info, x):
     theta = theta.to(DTYPE_FWD)
     if theta.dim() == 2: theta = theta.squeeze()
@@ -1031,6 +1120,7 @@ def forward_single_with_shared(theta, info, x):
         Q = a.to(DTYPE)
     return Q, shared_out.to(DTYPE)
 
+@tf32_forward
 def forward_bmm(thetas, info, x):
     thetas = thetas.to(DTYPE_FWD); x = x.to(DTYPE_FWD)
     num_sigma = thetas.shape[0]
@@ -2076,12 +2166,12 @@ import threading
 _VIDEO_THREADS: List[threading.Thread] = []
 
 def _greedy_record_rollout(theta_cpu, info, env_name, max_steps, obs_scale,
-                           video_folder, episode_idx, env_seed):
+                           video_folder, episode_idx, env_seed, env_kwargs=None):
     """현재 θ(=theta_cpu, CPU 사본)로 greedy(ε=0) rollout 1 에피소드를 rgb_array로
     렌더링하여 mp4 1개 저장. 학습 env와 완전히 분리된 독립 env에서 CPU forward로 동작."""
     try:
         from gymnasium.wrappers import RecordVideo
-        rec_env = gym.make(env_name, render_mode="rgb_array")
+        rec_env = gym.make(env_name, render_mode="rgb_array", **(env_kwargs or {}))
         # 이 env는 정확히 1 에피소드만 돌리므로 episode_trigger는 항상 True.
         rec_env = RecordVideo(
             rec_env, video_folder=video_folder,
@@ -2123,7 +2213,7 @@ def maybe_record_video(theta, info, cfg, episode_idx):
     # 학습 정책과 동일하게 정규화 적용 (use_input_norm=False면 스케일 미적용)
     obs_scale = cfg.obs_scale if cfg.use_input_norm else None
     args = (theta_cpu, info, cfg.env_name, cfg.max_steps, obs_scale,
-            video_folder, episode_idx, env_seed)
+            video_folder, episode_idx, env_seed, build_env_kwargs(cfg))
     if cfg.video_async:
         th = threading.Thread(target=_greedy_record_rollout, args=args, daemon=True)
         th.start()
@@ -4886,11 +4976,12 @@ def train_srrhuif():
     net_seed = cfg.network_seed if cfg.network_seed is not None else cfg.seed
     env_seed = cfg.env_seed if cfg.env_seed is not None else cfg.seed
     set_all_seeds(net_seed)
-    env = gym.make(cfg.env_name)
+    apply_tf32_config(cfg)  # cfg가 코드에서 바뀐 경우에도 반영 (idempotent)
+    env = gym.make(cfg.env_name, **build_env_kwargs(cfg))
     env.action_space.seed(net_seed)
     dimS, nA = env.observation_space.shape[0], env.action_space.n
     info = create_network_info(dimS, nA, cfg)
-    
+
     method_title = f"{'D3QN' if cfg.use_dueling else 'DDQN'} + {cfg.decoupling_mode.upper()} Decoupled"
     
     # ── 실제 작동 prior 선택 ──
@@ -4904,6 +4995,9 @@ def train_srrhuif():
     print(f"  {form_short}-{method_title} v6.0 Robust Session")
     print(f"  Env: {cfg.env_name} | obs_dim={dimS} | nA={nA} | max_steps={cfg.max_steps} "
           f"| input_norm={'on' if (cfg.use_input_norm and cfg.obs_scale) else 'off'}")
+    if cfg.env_name.startswith("LunarLander"):
+        print(f"  Wind: {'ON' if cfg.enable_wind else 'off'}"
+              + (f" (wind_power={cfg.wind_power:g}, turbulence_power={cfg.turbulence_power:g})" if cfg.enable_wind else ""))
     print(f"  Filter form: {cfg.filter_form} ({'Kim et al. 2010 Alg 1' if cfg.filter_form == 'covariance' else 'sqrt-information'})")
     print(f"  Horizon: {cfg.N_horizon} | Batch: {cfg.batch_size} | Params: {info['total_params']}")
     print(f"  Settings: {eff_prior_name}={eff_prior} (effective prior), Tikhonov={cfg.tikhonov_lambda}, Huber_c={cfg.huber_c}")
@@ -5535,7 +5629,8 @@ def train_adam():
     net_seed = cfg.network_seed if cfg.network_seed is not None else cfg.seed
     env_seed = cfg.env_seed if cfg.env_seed is not None else cfg.seed
     set_all_seeds(net_seed)
-    env = gym.make(cfg.env_name)
+    apply_tf32_config(cfg)  # cfg가 코드에서 바뀐 경우에도 반영 (idempotent)
+    env = gym.make(cfg.env_name, **build_env_kwargs(cfg))
     env.action_space.seed(net_seed)
     dimS, nA = env.observation_space.shape[0], env.action_space.n
     info = create_network_info(dimS, nA, cfg)
