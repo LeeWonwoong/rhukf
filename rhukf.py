@@ -99,7 +99,7 @@ def set_all_seeds(seed: int):
 torch.set_default_dtype(torch.float32)
 DTYPE = torch.float32
 DTYPE_FWD = torch.float32
-JITTER = 1e-6
+JITTER = 1e-7
 JITTER_TRIA = 1e-6
 
 # ── Fallback 발동 횟수 카운터 (수치적 안정성 진단용) ──
@@ -154,7 +154,7 @@ ENV_CONFIGS: Dict[str, Dict] = {
 class Config:
     env_name: str = "CartPole-v1"  #"LunarLander-v3"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    max_episodes: int = 1000
+    max_episodes: int = 200
     max_steps: int = 500
 
     # [env config] None이면 __post_init__에서 ENV_CONFIGS[env_name] 값으로 자동 채움.
@@ -175,7 +175,7 @@ class Config:
     decoupling_mode: str = 'fv'
 
     filter_form: str = 'covariance' # information or covariance
-    state_form: str = 'absolute' # absolute or error
+    state_form: str = 'error' # absolute or error
     measurement_mode: str = 'q_target' # q_target or pure_reward
     
     # [v7: Anchor type] state_form='error'에서 θ_anchor 결정 방식
@@ -231,7 +231,7 @@ class Config:
 
     buffer_size: int = 50000
     batch_size: int = 128
-    N_horizon: int = 7
+    N_horizon: int = 6
     
     q_init: float = 1e-2
     q_end: float = 1e-2
@@ -245,7 +245,7 @@ class Config:
     p_init: float = 0.05
     p_delta_init: float = 0.05
     
-    alpha: float = 0.01
+    alpha: float = 0.1
     beta: float = 2.0
     kappa: float = 0.0
     
@@ -308,6 +308,24 @@ class Config:
     diag_act_regime: bool = True
     act_regime_every: int = 5     # N 에피소드마다만 프로브 (1이면 매 에피소드)
     act_regime_warmup: int = 0    # 이 에피소드 이후부터만 프로브 (후반 phase 집중용)
+
+    # [probe] Sigma-spread activation (FV 전용): 시그마 클라우드가 레이어별 pre-act를
+    #   얼마나 퍼뜨리고(spread) 활성화가 그 spread를 증폭/수축(amp)하는지 — UKF runaway
+    #   메커니즘을 실제 시그마 포인트로 직접 관찰. 게이트 ON일 때만 시그마 forward 1회 추가.
+    diag_sigma_spread: bool = False
+    sigma_spread_every: int = 5
+    sigma_spread_warmup: int = 0
+
+    # [analysis] 로그 핵심원인 진단(VERDICT) + verbosity gating
+    #   'auto'   = 콘솔에 요약(VERDICT/culprit/trend)만, 룰 발동 시에만 파일에 풀 덤프
+    #   'always' = 기존 풀 덤프 유지 (요약은 위에 추가) / 'summary' = 요약만, 풀 덤프 항상 숨김
+    diag_log_mode: str = 'auto'
+    collapse_amp_thresh: float = 1.0   # sigma-spread amp 이 값 초과 + 증가 → RUNAWAY
+    cond_warn: float = 1e6             # cond(P_zz/Y) 경고
+    dead_warn: float = 0.3             # dead 뉴런 비율 경고
+    flip_warn: float = 0.4             # argmax flip rate 경고
+    prior_ratio_warn: float = 3.0      # |H^Tθ|/|z-ẑ| 경고 (prior 지배)
+    innov_warn: float = 1e3            # innovation max 폭발 경고
     save_file_log: bool = True
 
     def __post_init__(self):
@@ -1599,6 +1617,261 @@ def compute_act_regime(theta, info, x, act_name):
     return stats
 
 
+def _fv_layer_label(layer):
+    """info['layers'] 항목 → 진단 라벨 (S0/V0/A0/Q0...). collect_hidden_activations와 동일 규칙."""
+    return f"{layer['type'][0].upper()}{layer['layer_idx']}"
+
+
+@torch.no_grad()
+def fv_per_layer(info, vec, reduce='norm'):
+    """[FV diag] 전체 파라미터 축(dim 0 = n_x) 양을 네트워크 레이어 구간으로 잘라 per-layer dict 반환.
+       각 레이어 파라미터는 [W_start, b_start+b_len) 연속 구간.
+       vec: [n_x] 또는 [n_x, m] (Δθ·Kalman gain은 [n_x], P_xz/H^T는 [n_x, m]).
+       reduce='norm' → 구간 행들의 L2(Frobenius) norm, 'maxabs' → max(|.|), 'mean' → 평균."""
+    out = {}
+    for layer in info['layers']:
+        s = layer['W_start']
+        e = layer['b_start'] + layer['b_len']
+        seg = vec[s:e]
+        if reduce == 'maxabs':
+            out[_fv_layer_label(layer)] = seg.abs().max().item()
+        elif reduce == 'mean':
+            out[_fv_layer_label(layer)] = seg.mean().item()
+        else:
+            out[_fv_layer_label(layer)] = torch.norm(seg).item()
+    return out
+
+
+def fv_broadcast(info, value):
+    """[FV diag] 측정-공간 전역 스칼라(residual/cond 등)를 모든 레이어 라벨에 동일 값으로 복제.
+       per-layer 컬럼 정렬(Tier-1/DIAGNOSTICS 블록 key 일치)을 위해 사용 — 레이어별로 의미가 갈리지 않는 양."""
+    return {_fv_layer_label(layer): value for layer in info['layers']}
+
+
+@torch.no_grad()
+def compute_sigma_spread(unified_sigma, info, x, eps=1e-6):
+    """[Sigma-spread probe / FV] 시그마 클라우드(unified_sigma: [num_sigma, n_x])를 forward_bmm과
+    동일하게 전파하면서 hidden 레이어별로 '시그마 축(dim 0) 통계'를 측정.
+      spread = mean( std_σ(z) )                  pre-activation이 시그마로 퍼진 정도
+      amp    = mean(std_σ(f(z))) / spread        활성화가 그 spread에 가한 유효 게인
+                                                 (>1 증폭=runaway, <1 수축=안정)
+      frac_pos/frac_hi = 클라우드 전체 중 z>0 / z>2 비율 (증폭 구간 점유율)
+      z_max  = max|z|
+    forward_bmm과 동일한 residual/propagation 규칙을 그대로 따라 깊은 층 클라우드가 실제와 일치.
+    Returns: {layer_label: {spread, amp, frac_pos, frac_hi, z_max}, '__total__': {...}}.
+    """
+    thetas = unified_sigma.to(DTYPE_FWD)
+    x = x.to(DTYPE_FWD)
+    num_sigma = thetas.shape[0]
+    use_resid = info.get('use_residual', False)
+    act_fn = info['act_fn']
+    x_expanded = x.t().unsqueeze(0).expand(num_sigma, -1, -1)
+
+    stats = {}
+
+    def _record(layer, z_lin):
+        z_std = z_lin.std(dim=0)                    # [out, B] 시그마 축 spread
+        post_std = act_fn(z_lin).std(dim=0)
+        spread = z_std.mean()
+        stats[_fv_layer_label(layer)] = {
+            'spread': spread.item(),
+            'amp': (post_std.mean() / spread.clamp(min=eps)).item(),
+            'frac_pos': (z_lin > 0).float().mean().item(),
+            'frac_hi': (z_lin > 2.0).float().mean().item(),
+            'z_max': z_lin.abs().max().item(),
+        }
+
+    def _W(layer):
+        out_dim, in_dim = layer['W_shape']
+        W = thetas[:, layer['W_start']:layer['W_start'] + layer['W_len']].view(num_sigma, out_dim, in_dim)
+        b = thetas[:, layer['b_start']:layer['b_start'] + layer['b_len']].view(num_sigma, out_dim, 1)
+        return W, b, out_dim, in_dim
+
+    h = x_expanded
+    for i in range(info['shared_end_idx']):
+        layer = info['layers'][i]
+        W, b, out_dim, in_dim = _W(layer)
+        z_lin = torch.bmm(W, h) + b
+        _record(layer, z_lin)
+        z = act_fn(z_lin)
+        h = h + z if (use_resid and out_dim == in_dim) else z
+    shared_out = h
+
+    v = shared_out
+    for i in range(info['shared_end_idx'], info['value_end_idx']):
+        layer = info['layers'][i]
+        W, b, out_dim, in_dim = _W(layer)
+        z_lin = torch.bmm(W, v) + b
+        if i == info['value_end_idx'] - 1:
+            v = z_lin  # 출력층 (activation 없음) — 진단 제외
+        else:
+            _record(layer, z_lin)
+            z = act_fn(z_lin)
+            v = v + z if (use_resid and out_dim == in_dim) else z
+
+    a = shared_out
+    for i in range(info['value_end_idx'], len(info['layers'])):
+        layer = info['layers'][i]
+        W, b, out_dim, in_dim = _W(layer)
+        z_lin = torch.bmm(W, a) + b
+        if i == len(info['layers']) - 1:
+            a = z_lin  # 출력층 — 진단 제외
+        else:
+            _record(layer, z_lin)
+            z = act_fn(z_lin)
+            a = a + z if (use_resid and out_dim == in_dim) else z
+
+    if stats:
+        # 총계: 레이어 평균 (레이어마다 스케일이 달라 raw concat 대신 레이어 평균)
+        stats['__total__'] = {
+            'spread': float(np.mean([s['spread'] for s in stats.values()])),
+            'amp': float(np.mean([s['amp'] for s in stats.values()])),
+            'frac_pos': float(np.mean([s['frac_pos'] for s in stats.values()])),
+            'frac_hi': float(np.mean([s['frac_hi'] for s in stats.values()])),
+            'z_max': float(np.max([s['z_max'] for s in stats.values()])),
+        }
+    else:
+        stats['__total__'] = {'spread': 0.0, 'amp': 0.0, 'frac_pos': 0.0, 'frac_hi': 0.0, 'z_max': 0.0}
+    return stats
+
+
+# =========================================================================
+# 5b. Log Analysis Layer — "이 시점의 핵심 원인" 자동 진단
+#   이미 계산된 last_h_* / 에피소드 스칼라를 룰로 해석. 추가 연산 거의 없음.
+# =========================================================================
+_PREV_FB = {'chol_1e5': 0, 'tria_qr': 0}  # FB 누적 카운터의 직전 스냅샷 (interval delta용)
+
+
+def _traj_trend(traj):
+    """궤적 → (방향기호, 배율). 앞 1/3 평균 대비 뒤 1/3 평균. 증가=위험, 감소=수축(건강)."""
+    if traj is None or len(traj) < 2:
+        return ('·', 1.0)
+    n = len(traj)
+    k = max(1, n // 3)
+    a = float(np.mean(traj[:k]))
+    b = float(np.mean(traj[-k:]))
+    ratio = b / (abs(a) + 1e-8)
+    if ratio >= 1.5:   sym = '↑↑'
+    elif ratio >= 1.1: sym = '↑'
+    elif ratio <= 0.67: sym = '↓↓'
+    elif ratio <= 0.9: sym = '↓'
+    else:              sym = '→'
+    return (sym, ratio)
+
+
+def _peak_per_layer(layer_dicts):
+    """[{label:val}, …] (per-h 리스트) → {label: fold 최댓값}."""
+    if not layer_dicts:
+        return {}
+    return {l: max(d[l] for d in layer_dicts) for l in layer_dicts[0].keys()}
+
+
+def rank_culprit_layers(amp_h, ht_h, delta_h, cond_h):
+    """per-h×per-layer dict 리스트들 → badness 점수로 레이어 랭킹.
+    각 지표를 레이어별 fold-최댓값으로 환산 후 레이어축 max로 정규화해 합산.
+    Returns: [(label, score, {amp,ht,delta,cond}), …] 내림차순."""
+    sources = {'amp': _peak_per_layer(amp_h), 'ht': _peak_per_layer(ht_h),
+               'delta': _peak_per_layer(delta_h), 'cond': _peak_per_layer(cond_h)}
+    labels = set()
+    for d in sources.values():
+        labels |= set(d.keys())
+    if not labels:
+        return []
+    maxes = {k: (max(d.values()) if d else 0.0) for k, d in sources.items()}
+    scores = []
+    for l in labels:
+        s = sum((sources[k].get(l, 0.0) / maxes[k]) for k in sources if maxes[k] > 0)
+        detail = {k: sources[k].get(l, 0.0) for k in sources}
+        scores.append((l, s, detail))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores
+
+
+def build_log_diagnosis(data, cfg):
+    """이미 계산된 진단 자료(data dict)를 룰로 해석.
+    Returns: (verdicts: list[str] severity 내림차순, culprit: str|None, trend: str)."""
+    verdicts = []  # (severity, text)
+
+    # 1) SIGMA_RUNAWAY: 어떤 레이어 peak amp > thresh 이고 amp 집계가 fold 따라 증가
+    amp_h = data.get('amp_layer_h') or []
+    amp_tot = [float(np.mean(list(d.values()))) for d in amp_h] if amp_h else []
+    if amp_h:
+        peak = _peak_per_layer(amp_h)
+        top_l = max(peak, key=peak.get)
+        sym, _ = _traj_trend(amp_tot)
+        if peak[top_l] > cfg.collapse_amp_thresh and sym in ('↑', '↑↑'):
+            verdicts.append((peak[top_l] - cfg.collapse_amp_thresh,
+                             f"SIGMA_RUNAWAY({top_l}) amp {amp_tot[0]:.2f}→{amp_tot[-1]:.2f}"))
+
+    # 2) GAIN_RUNAWAY: act-regime mean f' 가 1 초과 + 증가
+    gain_h = data.get('gain_h') or []
+    if gain_h:
+        sym, _ = _traj_trend(gain_h)
+        if gain_h[-1] > 1.0 and sym in ('↑', '↑↑'):
+            verdicts.append((gain_h[-1] - 1.0, f"GAIN_RUNAWAY g {gain_h[0]:.2f}→{gain_h[-1]:.2f}"))
+
+    # 3) COV_ILLCOND: cond 큼 / P_avg 급증 / FB 발동
+    cond_h = data.get('cond_layer_h') or []
+    cond_max = max((max(d.values()) for d in cond_h), default=0.0)
+    p_sym, _ = _traj_trend(data.get('p_traj') or [])
+    fb_delta = data.get('fb_delta', 0)
+    if cond_max > cfg.cond_warn or p_sym == '↑↑' or fb_delta > 0:
+        sev = 0.0
+        if cond_max > cfg.cond_warn: sev += math.log10(cond_max / cfg.cond_warn)
+        if fb_delta > 0: sev += 0.5 * fb_delta
+        if p_sym == '↑↑': sev += 0.5
+        verdicts.append((sev, f"COV_ILLCOND cond {cond_max:.0e} FB+{fb_delta} P {p_sym}"))
+
+    # 4) PLASTICITY_LOSS: dead 비율 / eff_rank 저하
+    dead = data.get('dead_ratio')
+    eff_rank = data.get('eff_rank')
+    eff_ref = data.get('eff_rank_ref')
+    if (dead is not None and dead > cfg.dead_warn) or \
+       (eff_rank is not None and eff_rank > 0 and eff_ref and eff_rank < eff_ref):
+        rk = f"{eff_rank:.0f}" if (eff_rank and eff_rank > 0) else "?"
+        verdicts.append(((dead or 0.0), f"PLASTICITY_LOSS dead {100*(dead or 0):.0f}% rank {rk}"))
+
+    # 5) POLICY_THRASH: argmax flip
+    flip = data.get('argmax_flip', 0.0)
+    if flip > cfg.flip_warn:
+        verdicts.append((flip, f"POLICY_THRASH flip {flip:.2f}"))
+
+    # 6) PRIOR_DOMINATED: |H^Tθ| >> |z-ẑ|
+    decomp = data.get('innov_decomp') or []
+    if decomp:
+        resid_m = float(np.mean([d[0] for d in decomp]))
+        httheta_m = float(np.mean([d[1] for d in decomp]))
+        if resid_m > 1e-9 and httheta_m / resid_m > cfg.prior_ratio_warn:
+            verdicts.append((httheta_m / resid_m,
+                             f"PRIOR_DOMINATED H^Tθ/resid {httheta_m / resid_m:.1f}"))
+
+    # 7) INNOV_BLOWUP: innovation max 폭발
+    max_innov = data.get('max_innov')
+    if max_innov is not None and max_innov > cfg.innov_warn:
+        verdicts.append((max_innov / cfg.innov_warn, f"INNOV_BLOWUP max {max_innov:.1f}"))
+
+    verdicts.sort(key=lambda x: x[0], reverse=True)
+    verdict_strs = [t for _, t in verdicts]
+
+    # 범인 레이어 랭킹
+    ranking = rank_culprit_layers(amp_h, data.get('ht_layer_h') or [],
+                                  data.get('delta_layer_h') or [], cond_h)
+    culprit = None
+    if ranking:
+        l, _, d = ranking[0]
+        culprit = (f"{l} (amp{d['amp']:.2f}, ht{d['ht']:.2f}, "
+                   f"Δθ{d['delta']:.3f}, cond{d['cond']:.0e})")
+
+    # trend 시그니처
+    def _t(name, traj):
+        sym, r = _traj_trend(traj)
+        return f"{name} {sym}(×{r:.1f})" if sym not in ('·', '→') else f"{name} {sym}"
+    trend = "  ".join([_t('gain', gain_h), _t('amp', amp_tot),
+                       _t('P_avg', data.get('p_traj') or []),
+                       _t('K', data.get('k_traj') or [])])
+    return verdict_strs, culprit, trend
+
+
 REF_STATES = torch.tensor([
     [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.05, 0.0], [0.0, 0.0, -0.05, 0.0],
     [0.0, 0.0, 0.1, 0.5], [0.0, 0.0, -0.1, -0.5],
@@ -1607,6 +1880,14 @@ REF_NAMES = ["balance", "tilt_R", "tilt_L", "fall_R", "fall_L"]
 
 @torch.no_grad()
 def compute_ref_q_values(theta, info, normalizer, device):
+    # REF_STATES는 CartPole 전용 (obs 4-dim, binary action: dq=q1-q0). 다른 env면 건너뜀.
+    if info['dimS'] != REF_STATES.shape[1] or info['nA'] < 2:
+        if not getattr(compute_ref_q_values, '_warned', False):
+            print(f"[경고] diag_ref_states: REF_STATES는 CartPole(obs=4, nA=2) 전용 — "
+                  f"현재 env(obs={info['dimS']}, nA={info['nA']})와 불일치하여 ref-state 진단을 건너뜁니다. "
+                  f"(cfg.diag_ref_states=False 로 끄는 것을 권장)")
+            compute_ref_q_values._warned = True
+        return None
     ref = REF_STATES.to(device)
     ref_norm = normalizer.normalize(ref) if normalizer else ref
     Q = forward_single(theta.squeeze(), info, ref_norm.t())
@@ -2380,14 +2661,17 @@ def srrhuif_step_fv(theta_current_in, theta_target, filter_S_info, batch, sp,
         'y_new_norm': torch.norm(y_new).item(),
         'adapt_ratio': adapt_factor.mean().item(),
         # FV는 layer 분리 없으니 per_layer dict는 비움 (training loop이 .get() 패턴 사용)
-        'per_layer_ht': {'fv': torch.norm(HT).item()},
-        'per_layer_delta': {'fv': delta_theta_norm},
-        'per_layer_resid_max': {'fv': resid_abs.max().item()},
-        'per_layer_cond': {'fv': 1.0},        # placeholder
-        'per_layer_ymax': {'fv': torch.max(torch.abs(y_new)).item()},
-        'per_layer_cond_full': {'fv': 1.0},
+        # FV: 전체 벡터를 네트워크 레이어 구간으로 분해 (가로=layer, 세로=horizon 정밀 진단)
+        'per_layer_ht': fv_per_layer(info, HT, 'norm'),
+        'per_layer_delta': fv_per_layer(info, (theta_new - theta_pred).squeeze(-1), 'norm'),
+        'per_layer_resid_max': fv_broadcast(info, resid_abs.max().item()),  # 측정-공간 전역
+        'per_layer_cond': fv_broadcast(info, 1.0),        # placeholder (정보형 cond 미산출)
+        'per_layer_ymax': fv_per_layer(info, y_new, 'maxabs'),  # per-layer 정보벡터 max
+        'per_layer_cond_full': fv_broadcast(info, 1.0),
     }
     
+    if sp.get('_do_sigma_spread', False):
+        dbg['sigma_spread'] = compute_sigma_spread(unified, info, s_batch)
     return theta_new, S_new, loss.item(), target_var, k_gain_norm, dbg
 
 
@@ -2610,17 +2894,19 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
         'y_pred_norm': torch.norm(theta_pred_flat).item(),
         'y_new_norm': torch.norm(theta_new_flat).item(),
         'adapt_ratio': adapt_factor.mean().item(),
-        # FV는 layer 분리 없음 — per_layer dict는 'fv' 키 하나로
-        'per_layer_ht': {'fv': torch.norm(P_xz).item()},
-        'per_layer_delta': {'fv': delta_theta_norm},
-        'per_layer_resid_max': {'fv': innov_abs.max().item()},
-        # 정보형 'cond(Y)' 자리에 cond(P_zz) (innovation cov 조건수)
-        'per_layer_cond': {'fv': cond_P_zz},
-        # 정보형 'Y_max' 자리에 max_P (parameter uncertainty maximum)
-        'per_layer_ymax': {'fv': max_P},
-        'per_layer_cond_full': {'fv': cond_P_zz},
+        # FV: 전체 벡터를 네트워크 레이어 구간으로 분해 (가로=layer, 세로=horizon 정밀 진단)
+        'per_layer_ht': fv_per_layer(info, P_xz, 'norm'),  # ||P_xz|| 행 = 레이어별 측정-상태 민감도
+        'per_layer_delta': fv_per_layer(info, theta_new_flat - theta_pred_flat, 'norm'),
+        'per_layer_resid_max': fv_broadcast(info, innov_abs.max().item()),  # 측정-공간 전역
+        # 정보형 'cond(Y)' 자리에 cond(P_zz) (innovation cov 조건수, 측정-공간 전역)
+        'per_layer_cond': fv_broadcast(info, cond_P_zz),
+        # 정보형 'Y_max' 자리에 per-layer max diag(P) (레이어별 파라미터 불확실성)
+        'per_layer_ymax': fv_per_layer(info, P_diag, 'maxabs'),
+        'per_layer_cond_full': fv_broadcast(info, cond_P_zz),
     }
     
+    if sp.get('_do_sigma_spread', False):
+        dbg['sigma_spread'] = compute_sigma_spread(unified, info, s_batch)
     return theta_new, P_new, loss.item(), target_var, k_gain_norm, dbg
 
 
@@ -3177,12 +3463,13 @@ def srrhuif_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         'y_pred_norm': torch.norm(y_pred_delta).item(),
         'y_new_norm': torch.norm(y_delta_new).item(),
         'adapt_ratio': adapt_factor.mean().item(),
-        'per_layer_ht': {'fv': torch.norm(H_T).item()},
-        'per_layer_delta': {'fv': delta_correction_norm},
-        'per_layer_resid_max': {'fv': resid_abs.max().item()},
-        'per_layer_cond': {'fv': 1.0},
-        'per_layer_ymax': {'fv': torch.max(torch.abs(y_delta_new)).item()},
-        'per_layer_cond_full': {'fv': 1.0},
+        # FV: 전체 벡터를 네트워크 레이어 구간으로 분해 (가로=layer, 세로=horizon 정밀 진단)
+        'per_layer_ht': fv_per_layer(info, H_T, 'norm'),
+        'per_layer_delta': fv_per_layer(info, mu_delta_new - mu_delta_prev, 'norm'),
+        'per_layer_resid_max': fv_broadcast(info, resid_abs.max().item()),  # 측정-공간 전역
+        'per_layer_cond': fv_broadcast(info, 1.0),
+        'per_layer_ymax': fv_per_layer(info, y_delta_new, 'maxabs'),  # per-layer 정보벡터 max
+        'per_layer_cond_full': fv_broadcast(info, 1.0),
         # error-state 전용 추가
         'mu_delta_norm': torch.norm(mu_delta_new).item(),
     }
@@ -3191,7 +3478,9 @@ def srrhuif_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         'mu_delta': mu_delta_new,
         'S_Y_delta': S_Y_delta_new,
     }
-    
+
+    if sp.get('_do_sigma_spread', False):
+        dbg['sigma_spread'] = compute_sigma_spread(unified, info, s_batch)
     return theta_active, filter_state_new, loss.item(), target_var, k_gain_norm, dbg
 
 
@@ -3383,12 +3672,13 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         'y_pred_norm': torch.norm(mu_delta_prev).item(),  # error-state: Δμ_prev norm
         'y_new_norm': torch.norm(mu_delta_new).item(),
         'adapt_ratio': adapt_factor.mean().item(),
-        'per_layer_ht': {'fv': torch.norm(P_delta_z).item()},
-        'per_layer_delta': {'fv': delta_correction_norm},
-        'per_layer_resid_max': {'fv': innov_abs.max().item()},
-        'per_layer_cond': {'fv': cond_P_zz},
-        'per_layer_ymax': {'fv': max_P},
-        'per_layer_cond_full': {'fv': cond_P_zz},
+        # FV: 전체 벡터를 네트워크 레이어 구간으로 분해 (가로=layer, 세로=horizon 정밀 진단)
+        'per_layer_ht': fv_per_layer(info, P_delta_z, 'norm'),  # ||P_xz|| 행 = 레이어별 측정-상태 민감도
+        'per_layer_delta': fv_per_layer(info, mu_delta_new - mu_delta_prev, 'norm'),
+        'per_layer_resid_max': fv_broadcast(info, innov_abs.max().item()),  # 측정-공간 전역
+        'per_layer_cond': fv_broadcast(info, cond_P_zz),  # innovation cov 조건수, 측정-공간 전역
+        'per_layer_ymax': fv_per_layer(info, P_diag, 'maxabs'),  # per-layer max diag(P) 불확실성
+        'per_layer_cond_full': fv_broadcast(info, cond_P_zz),
         'mu_delta_norm': torch.norm(mu_delta_new).item(),
     }
     
@@ -3396,7 +3686,9 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         'mu_delta': mu_delta_new,
         'P_delta': P_delta_new,
     }
-    
+
+    if sp.get('_do_sigma_spread', False):
+        dbg['sigma_spread'] = compute_sigma_spread(unified, info, s_batch)
     return theta_active, filter_state_new, loss.item(), target_var, k_gain_norm, dbg
 
 
@@ -4760,6 +5052,7 @@ def train_srrhuif():
         last_h_layer_cond, last_h_layer_ymax = [], []
         last_h_gain_traj, last_h_pos_traj, last_h_maxz_traj = [], [], []
         last_h_layer_gain = []  # [probe] per-h × per-layer mean_gain dict 리스트
+        last_h_layer_spread, last_h_layer_amp, last_h_layer_spos = [], [], []  # [sigma-spread] per-h × per-layer
         last_ep_cos = None
         
         ep_cond_collect, ep_ymax_collect, ep_argmax_flips = {}, {}, []
@@ -4839,12 +5132,19 @@ def train_srrhuif():
                     h_layer_resid_max = []
                     h_gain_traj, h_pos_traj, h_maxz_traj = [], [], []  # [probe] per-h 집계
                     h_layer_gain = []                                  # [probe] per-h × per-layer
+                    h_layer_spread, h_layer_amp, h_layer_spos = [], [], []  # [sigma-spread] per-h × per-layer
                     prev_h_delta = None
                     # [probe] Per-h activation regime 게이팅: 플래그 + cadence + warmup
                     #   매 h forward가 추가되므로 반드시 게이팅 (throughput 보호).
                     do_act_regime = (cfg.diag_act_regime
                                      and ep >= cfg.act_regime_warmup
                                      and (ep % max(cfg.act_regime_every, 1) == 0))
+                    # [sigma-spread] 게이팅: step 내부에서 시그마 forward 1회 추가되므로 cadence 필수.
+                    #   sp 통해 step 함수로 전달 (step은 ep를 모름).
+                    do_sigma_spread = (cfg.diag_sigma_spread
+                                       and ep >= cfg.sigma_spread_warmup
+                                       and (ep % max(cfg.sigma_spread_every, 1) == 0))
+                    sp['_do_sigma_spread'] = do_sigma_spread
                     # [v5] q_next_caches 사전계산 제거 — 매 horizon step 내부에서 계산
                     
                     if cfg.diag_argmax_flip:
@@ -4959,6 +5259,13 @@ def train_srrhuif():
                             h_layer_gain.append({l: reg[l]['mean_gain']
                                                  for l in reg if l != '__total__'})
 
+                        # [sigma-spread] step이 dbg에 실어준 시그마 클라우드 레이어별 통계 수집.
+                        if 'sigma_spread' in dbg:
+                            ss = dbg['sigma_spread']
+                            h_layer_spread.append({l: ss[l]['spread'] for l in ss if l != '__total__'})
+                            h_layer_amp.append({l: ss[l]['amp'] for l in ss if l != '__total__'})
+                            h_layer_spos.append({l: ss[l]['frac_pos'] for l in ss if l != '__total__'})
+
                     if cfg.diag_argmax_flip:
                         with torch.no_grad():
                             argmax_after = forward_single(theta.squeeze(), info, s_flip).argmax(dim=0)
@@ -4997,6 +5304,8 @@ def train_srrhuif():
                     if do_act_regime:  # 프로브가 돈 horizon에서만 갱신 (off 에피소드엔 직전 값 유지)
                         last_h_gain_traj, last_h_pos_traj, last_h_maxz_traj = h_gain_traj, h_pos_traj, h_maxz_traj
                         last_h_layer_gain = h_layer_gain
+                    if do_sigma_spread and h_layer_spread:
+                        last_h_layer_spread, last_h_layer_amp, last_h_layer_spos = h_layer_spread, h_layer_amp, h_layer_spos
 
                 update_times.append(time.perf_counter() - update_start)
 
@@ -5072,9 +5381,34 @@ def train_srrhuif():
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | Q_std: {sp.get('current_q_std', cfg.q_init):.1e} | R_std: {sp.get('current_r_std', cfg.r_init):.1e} | P_avg: {avg_P_ep:.4f} (P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
                   f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
 
-            file_print(f"          └─▶ Innov (Mean / Max): [{avg_i_mean:.4f} / {max_i_max:.4f}]")
-            
-            if last_h_k_traj:
+            # ── [분석 레이어] 핵심 원인 진단(VERDICT) + verbosity gating ──
+            _fb_delta = (FALLBACK_COUNTS['chol_1e5'] - _PREV_FB['chol_1e5']) \
+                      + (FALLBACK_COUNTS['tria_qr'] - _PREV_FB['tria_qr'])
+            _eff_ref = (cfg.shared_layers[-1] * 0.3) if cfg.shared_layers else None
+            _diag_data = {
+                'gain_h': last_h_gain_traj, 'amp_layer_h': last_h_layer_amp,
+                'ht_layer_h': last_h_layer_ht, 'delta_layer_h': last_h_layer_delta,
+                'cond_layer_h': last_h_layer_cond, 'p_traj': last_h_p_traj,
+                'k_traj': last_h_k_traj, 'innov_decomp': last_h_innov_decomp,
+                'dead_ratio': (act_health['__total__']['dead_ratio'] if act_health else None),
+                'eff_rank': eff_rank_val, 'eff_rank_ref': _eff_ref,
+                'argmax_flip': avg_argmax_flip, 'max_innov': max_i_max, 'fb_delta': _fb_delta,
+            }
+            _verdicts, _culprit, _trend = build_log_diagnosis(_diag_data, cfg)
+            if _verdicts:
+                print(f"        ⚑ VERDICT: " + " | ".join(_verdicts[:2]))
+                if _culprit: print(f"        culprit: {_culprit}")
+            else:
+                print(f"        ⚑ VERDICT: OK")
+            print(f"        trend: {_trend}")
+            _PREV_FB['chol_1e5'], _PREV_FB['tria_qr'] = FALLBACK_COUNTS['chol_1e5'], FALLBACK_COUNTS['tria_qr']
+
+            verbose = (cfg.diag_log_mode == 'always') or (cfg.diag_log_mode == 'auto' and len(_verdicts) > 0)
+            dprint = file_print if verbose else (lambda *a, **k: None)
+
+            dprint(f"          └─▶ Innov (Mean / Max): [{avg_i_mean:.4f} / {max_i_max:.4f}]")
+
+            if verbose and last_h_k_traj:
                 fmt = lambda traj: "[" + ", ".join([f"{v:.4f}" for v in traj]) + "]"
                 fmt_e = lambda traj: "[" + ", ".join([f"{v:.2e}" for v in traj]) + "]"
                 fmt2 = lambda traj: "[" + ", ".join([f"{v:+.3f}" for v in traj]) + "]"
@@ -5111,9 +5445,24 @@ def train_srrhuif():
                     max_ht_per_layer = {l: max(last_h_layer_ht[h][l] for h in range(len(last_h_layer_ht))) for l in labels}
                     dominant = max(max_ht_per_layer, key=max_ht_per_layer.get)
                     file_print(f"          └─▶ Dominant layer: {dominant} (max||H^T||={max_ht_per_layer[dominant]:.1f})")
-            
-            file_print(f"          ══ DIAGNOSTICS ══")
-            if last_h_layer_cond:
+
+                # [sigma-spread] 세로=horizon, 가로=layer. amp>1이 fold 따라 커지면 runaway.
+                if last_h_layer_spread:
+                    ss_labels = sorted(last_h_layer_spread[0].keys())
+                    file_print(f"          ══ [Tier 2] Sigma-Spread Activation ══")
+                    for h_idx in range(len(last_h_layer_spread)):
+                        file_print(f"          ├─▶ spread h={h_idx}:  " + " ".join([f"{l}={last_h_layer_spread[h_idx][l]:.3f}" for l in ss_labels]))
+                    for h_idx in range(len(last_h_layer_amp)):
+                        file_print(f"          ├─▶ amp    h={h_idx}:  " + " ".join([f"{l}={last_h_layer_amp[h_idx][l]:.3f}" for l in ss_labels]))
+                    for h_idx in range(len(last_h_layer_spos)):
+                        file_print(f"          ├─▶ pos%   h={h_idx}:  " + " ".join([f"{l}={100*last_h_layer_spos[h_idx][l]:.0f}%" for l in ss_labels]))
+                    # 레이어별 amp가 horizon 동안 1을 넘는 fold가 있으면 증폭(runaway) 신호
+                    amp_max_per_layer = {l: max(last_h_layer_amp[h][l] for h in range(len(last_h_layer_amp))) for l in ss_labels}
+                    hot = max(amp_max_per_layer, key=amp_max_per_layer.get)
+                    file_print(f"          └─▶ Max amp layer: {hot} (peak amp={amp_max_per_layer[hot]:.3f}; >1=증폭)")
+
+            dprint(f"          ══ DIAGNOSTICS ══")
+            if verbose and last_h_layer_cond:
                 labels = sorted(last_h_layer_cond[0].keys())
                 for h_idx in range(len(last_h_layer_cond)):
                     file_print(f"          ├─▶ cond(Y)h={h_idx}: " + " ".join([f"{l}={last_h_layer_cond[h_idx][l]:.1e}" for l in labels]))
@@ -5121,11 +5470,11 @@ def train_srrhuif():
                     file_print(f"          ├─▶ Y_max  h={h_idx}: " + " ".join([f"{l}={last_h_layer_ymax[h_idx][l]:.1e}" for l in labels]))
             
             labels = sorted(theta_norms.keys())
-            file_print(f"          ├─▶ ||θ|| per layer:   " + " ".join([f"{l}={theta_norms[l]:.3f}" for l in labels]))
-            file_print(f"          ├─▶ Adv/Q null/signal: ratio={null_ratio:.4f} (null={null_abs:.4f}, signal={signal_abs:.4f})")
+            dprint(f"          ├─▶ ||θ|| per layer:   " + " ".join([f"{l}={theta_norms[l]:.3f}" for l in labels]))
+            dprint(f"          ├─▶ Adv/Q null/signal: ratio={null_ratio:.4f} (null={null_abs:.4f}, signal={signal_abs:.4f})")
 
             # [v9+] Activation health (포화 / 죽은 뉴런)
-            if act_health is not None:
+            if verbose and act_health is not None:
                 tot = act_health['__total__']
                 file_print(
                     f"          ├─▶ Act health ({cfg.activation_fn}): "
@@ -5150,15 +5499,15 @@ def train_srrhuif():
                             for l in ah_labels
                         ])
                     )
-            if eff_rank_val > 0:
+            if verbose and eff_rank_val > 0:
                 file_print(f"          ├─▶ Shared rank:       eff={eff_rank_val:.1f}/{cfg.shared_layers[-1] if cfg.shared_layers else 'N/A'}, stable={stable_rank_val:.2f}")
-            file_print(f"          ├─▶ Argmax flip rate:  {avg_argmax_flip:.4f} (updates={len(ep_argmax_flips)})")
-            if buf_info is not None:
+            dprint(f"          ├─▶ Argmax flip rate:  {avg_argmax_flip:.4f} (updates={len(ep_argmax_flips)})")
+            if verbose and buf_info is not None:
                 sat_str = "YES" if buf_info['is_saturated'] else "no"
                 file_print(f"          ├─▶ Buffer diag:       fill={buf_info['fill_ratio']:.3f}({sat_str}) state_std={buf_info['state_std']:.4f} state_range={buf_info['state_range']:.3f}")
                 file_print(f"          ├─▶ Buffer samples:    done_ratio={buf_info['done_ratio']:.4f} r_std={buf_info['reward_std']:.4f} r_mean={buf_info['reward_mean']:.4f}")
                 file_print(f"          ├─▶ Buffer age:        ep[{buf_info['age_min']}..{buf_info['age_max']}] range={buf_info['age_range']} std={buf_info['age_std']:.2f}")
-            if ref_q:
+            if verbose and ref_q:
                 file_print(f"          └─▶ Ref states:        " + " ".join([f"{name}:ΔQ={ref_q[name]['dq']:+.4f}(a={ref_q[name]['argmax']})" for name in REF_NAMES]))
 
     logger.total_time = time.time() - train_start_time
