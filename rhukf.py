@@ -309,16 +309,23 @@ class Config:
     p_delta_init: float = 0.05
     
     alpha: float = 0.1
+
     beta: float = 2.0
     kappa: float = 0.0
     
     use_n_step: bool = True
     n_step_size: int = 3
 
-    use_per: bool = False
+    use_per: bool = True
     per_alpha: float = 0.6      # priority 지수 (Schaul 2016 기본값)
     per_eps: float = 1e-6       # 0 priority 방지용 offset
-    per_apply_is_weight: bool = False  # IS weight를 R inflation으로 반영 (실험용)
+    # [IS-R] IS-weight를 측정 노이즈 R 변조로 반영 (2차 최적화기용 bias 보정).
+    #   R_i = R_base · w_i^(-β). 과샘플(작은 w) 샘플 → R↑ → per-event 신뢰↓ → 공분산 과수축/붕괴 억제.
+    #   use_per + per_apply_is_weight면 FV step에서 Huber 적응 R 대신 IS-R 사용.
+    per_apply_is_weight: bool = True
+    per_w_floor: float = 0.1        # w 하한 → 최대 R 배율 = floor^(-β) 캡 (R 폭발 방지)
+    per_beta_start: float = 0.4     # IS 강도 β annealing 시작 (초반 편향 허용=빠른 학습)
+    per_beta_end: float = 1.0       # β annealing 끝 (완전 불편보정)
 
     warmup_step : int = 0
 
@@ -567,8 +574,13 @@ class Config:
             state_tag = "ABS"
         # [v9+] measurement mode tag
         meas_tag = "MQ" if self.measurement_mode == 'q_target' else "MR"  # MQ = Q_target, MR = pure_Reward
-        # [v9+] PER tag
-        per_tag = f"_PER{self.per_alpha}" if self.use_per else ""
+        # [v9+] PER tag — 켰는지/IS-R 설정을 파일명에 명시 (off도 _noPER로 구분 가능하게)
+        if self.use_per:
+            is_tag = (f"i{self.per_beta_start:g}-{self.per_beta_end:g}f{self.per_w_floor:g}"
+                      if self.per_apply_is_weight else "iOFF")
+            per_tag = f"_PERa{self.per_alpha:g}{is_tag}"
+        else:
+            per_tag = "_noPER"
         # [v9+] Adam warm-up tag
         adam_tag = f"_adam{self.adam_lr:g}" if self.use_adam_warmup else ""
         # [LunarLander wind] wind 켜면 결과가 섞이지 않도록 태그 추가
@@ -687,15 +699,26 @@ parser.add_argument('--measurement_mode', type=str, default=cfg.measurement_mode
                     choices=['q_target', 'pure_reward'],
                     help="[v9+] 'q_target'=y=r+γQ(s',a*;θ_T), h(w)=Q(s,a;w) (기존). "
                          "'pure_reward'=y=r, h(w)=Q(s,a;w)-γQ(s',a*;w) (신규, Kalman-pure).")
-parser.add_argument('--use_per', action='store_true',
+parser.add_argument('--use_per', dest='use_per', action='store_true', default=cfg.use_per,
                     help="[v9+] Prioritized Experience Replay 활성화. pure_reward 모드에서 "
                          "terminal transition을 oversampling하여 Q-floating을 방지.")
+parser.add_argument('--no_per', dest='use_per', action='store_false',
+                    help="PER 비활성 (uniform sampling)")
 parser.add_argument('--per_alpha', type=float, default=cfg.per_alpha,
                     help="[v9+] PER priority exponent (default 0.6, Schaul 2016)")
 parser.add_argument('--per_eps', type=float, default=cfg.per_eps,
                     help="[v9+] PER zero-priority offset (default 1e-6)")
-parser.add_argument('--per_apply_is_weight', action='store_true',
-                    help="[v9+] IS weight를 R inflation으로 반영 (실험적, off by default)")
+parser.add_argument('--per_apply_is_weight', dest='per_apply_is_weight', action='store_true',
+                    default=cfg.per_apply_is_weight,
+                    help="[IS-R] IS weight를 R 변조로 반영 (R_i=R_base·w^-β). 기본 ON.")
+parser.add_argument('--no_per_apply_is_weight', dest='per_apply_is_weight', action='store_false',
+                    help="[IS-R] 비활성 → 기존 Huber 적응 R 사용")
+parser.add_argument('--per_w_floor', type=float, default=cfg.per_w_floor,
+                    help="[IS-R] w 하한 (최대 R 배율=floor^-β 캡, default %(default)s)")
+parser.add_argument('--per_beta_start', type=float, default=cfg.per_beta_start,
+                    help="[IS-R] IS 강도 β annealing 시작 (default %(default)s)")
+parser.add_argument('--per_beta_end', type=float, default=cfg.per_beta_end,
+                    help="[IS-R] IS 강도 β annealing 끝 (default %(default)s)")
 parser.add_argument('--anchor_type', type=str, default=cfg.anchor_type,
                     choices=['target', 'current', 'init'],
                     help="Error-state anchor: 'target'=θ_target, 'current'=θ_active_prev, "
@@ -709,16 +732,20 @@ parser.add_argument('--h0_online_moving_init', type=str, default=cfg.h0_online_m
                          "'theta_target'=θ_target, 'spas'=sigma ensemble mean (FV 전용)")
 parser.add_argument('--p_delta_init', type=float, default=cfg.p_delta_init,
                     help="Error-state P_Δ initial scale (trust region)")
-parser.add_argument('--use_twin', action='store_true',
+parser.add_argument('--use_twin', dest='use_twin', action='store_true', default=cfg.use_twin,
                     help="Twin-Q (Clipped Double Q-Learning). 두 독립 (θ_1, θ_2)로 min target.")
+parser.add_argument('--no_twin', dest='use_twin', action='store_false',
+                    help="Twin-Q 비활성")
 parser.add_argument('--activation_fn', type=str, default=cfg.activation_fn,
                     choices=['tanh', 'relu', 'leaky_relu', 'mish', 'gelu', 'silu'],
                     help="히든 레이어 활성화 함수")
 parser.add_argument('--node_layer_other_source', type=str, default=cfg.node_layer_other_source,
                     choices=['current', 'prior'],
                     help="Node/Layer 모드에서 OTHER 레이어들의 θ source: 'current' (running 추정치, 기존) / 'prior' (h=0 기준점)")
-parser.add_argument('--use_residual', action='store_true',
+parser.add_argument('--use_residual', dest='use_residual', action='store_true', default=cfg.use_residual,
                     help="Same-dim hidden layers에 residual (skip) connection 추가. UKF의 hidden layer vanishing 신호 문제 해결.")
+parser.add_argument('--no_residual', dest='use_residual', action='store_false',
+                    help="residual connection 비활성")
 parser.add_argument('--shared_layers', type=int, nargs='*', default=None,
                     help="Shared hidden layer sizes (예: --shared_layers 16 16). 미지정 시 Config default.")
 parser.add_argument('--value_layers', type=int, nargs='*', default=None,
@@ -795,6 +822,9 @@ cfg.use_per = args.use_per
 cfg.per_alpha = args.per_alpha
 cfg.per_eps = args.per_eps
 cfg.per_apply_is_weight = args.per_apply_is_weight
+cfg.per_w_floor = args.per_w_floor
+cfg.per_beta_start = args.per_beta_start
+cfg.per_beta_end = args.per_beta_end
 cfg.anchor_type = args.anchor_type
 cfg.ddqn_argmax = args.ddqn_argmax
 cfg.h0_online_moving_init = args.h0_online_moving_init
@@ -2693,7 +2723,13 @@ def srrhuif_step_fv(theta_current_in, theta_target, filter_S_info, batch, sp,
     
     # Huber-style adaptive R
     res_abs = torch.abs(residual)
-    adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)  # [batch_sz, 1]
+    if cfg.use_per and cfg.per_apply_is_weight:
+        # [IS-R] Huber 대신 IS-weight 기반 R 변조: R_i = R_base · w_i^(-β)
+        _w = batch['is_weights'].clamp(min=cfg.per_w_floor)
+        _beta = sp.get('current_per_beta', 1.0)
+        adapt_factor = (_w ** (-_beta)).reshape(res_abs.shape)
+    else:
+        adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)  # [batch_sz, 1]
     r_inv_adapt = r_inv / adapt_factor  # [batch_sz, 1]
     r_inv_sqrt_adapt = (r_inv_sqrt / torch.sqrt(adapt_factor)).t()  # [1, batch_sz]
     
@@ -2909,7 +2945,13 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
     #     큰 |residual| 샘플은 R_eff↑ → P_zz_diag↑ → K_col↓ → 영향력 감소
     # ═════════════════════════════════════════════════════════════
     res_abs = torch.abs(residual).squeeze(-1)  # [batch_sz]
-    adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)  # [batch_sz]
+    if cfg.use_per and cfg.per_apply_is_weight:
+        # [IS-R] Huber 대신 IS-weight 기반 R 변조: R_i = R_base · w_i^(-β)
+        _w = batch['is_weights'].clamp(min=cfg.per_w_floor)
+        _beta = sp.get('current_per_beta', 1.0)
+        adapt_factor = (_w ** (-_beta)).reshape(res_abs.shape)
+    else:
+        adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)  # [batch_sz]
     
     current_r_std = sp.get('current_r_std', cfg.r_init)
     R_diag_eff = (current_r_std ** 2) * adapt_factor  # [batch_sz], per-sample variance
@@ -3496,7 +3538,13 @@ def srrhuif_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     r_inv = 1.0 / (current_r_std ** 2)
     r_inv_sqrt = 1.0 / current_r_std
     res_abs = torch.abs(residual)
-    adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)  # [B, 1]
+    if cfg.use_per and cfg.per_apply_is_weight:
+        # [IS-R] Huber 대신 IS-weight 기반 R 변조: R_i = R_base · w_i^(-β)
+        _w = batch['is_weights'].clamp(min=cfg.per_w_floor)
+        _beta = sp.get('current_per_beta', 1.0)
+        adapt_factor = (_w ** (-_beta)).reshape(res_abs.shape)
+    else:
+        adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)  # [B, 1]
     r_inv_adapt = r_inv / adapt_factor  # [B, 1]
     r_inv_sqrt_adapt = (r_inv_sqrt / torch.sqrt(adapt_factor)).t()  # [1, B]
     
@@ -3709,7 +3757,13 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     
     # Huber-adaptive R (per-sample variance inflation)
     res_abs = torch.abs(residual).squeeze(-1)
-    adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)
+    if cfg.use_per and cfg.per_apply_is_weight:
+        # [IS-R] Huber 대신 IS-weight 기반 R 변조: R_i = R_base · w_i^(-β)
+        _w = batch['is_weights'].clamp(min=cfg.per_w_floor)
+        _beta = sp.get('current_per_beta', 1.0)
+        adapt_factor = (_w ** (-_beta)).reshape(res_abs.shape)
+    else:
+        adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)
     current_r_std = sp.get('current_r_std', cfg.r_init)
     R_diag_eff = (current_r_std ** 2) * adapt_factor
     P_zz = P_zz_sigma + torch.diag(R_diag_eff)
@@ -5003,6 +5057,14 @@ def train_srrhuif():
     print(f"  Settings: {eff_prior_name}={eff_prior} (effective prior), Tikhonov={cfg.tikhonov_lambda}, Huber_c={cfg.huber_c}")
     print(f"  N-step: use={cfg.use_n_step}, size={cfg.n_step_size} "
           f"(target γ = {cfg.gamma ** cfg.n_step_size if cfg.use_n_step else cfg.gamma:.4f})")
+    if cfg.use_per:
+        if cfg.per_apply_is_weight:
+            print(f"  PER: ON (alpha={cfg.per_alpha:g}) | IS-R: ON (R=R_base·w^-β, "
+                  f"β {cfg.per_beta_start:g}→{cfg.per_beta_end:g}, w_floor={cfg.per_w_floor:g}) | Huber 우회")
+        else:
+            print(f"  PER: ON (alpha={cfg.per_alpha:g}) | IS-R: off → Huber-adaptive R (c={cfg.huber_c:g})")
+    else:
+        print(f"  PER: off (uniform sampling, Huber-adaptive R, c={cfg.huber_c:g})")
     print(f"  Output Dir: {cfg.outdir}")
     print(f"  Seeds: network={net_seed}, env={env_seed}")
     print(f"{'='*60}\n")
@@ -5158,6 +5220,7 @@ def train_srrhuif():
                 eps = 1.0
                 sp['current_q_std'] = cfg.q_init
                 sp['current_r_std'] = cfg.r_init
+                sp['current_per_beta'] = cfg.per_beta_start  # [IS-R] β annealing 시작값
             else:
                 active_steps = steps_done - cfg.warmup_step
                 decay_factor = np.exp(-active_steps / cfg.eps_decay_steps)
@@ -5165,6 +5228,8 @@ def train_srrhuif():
                 # Q, R를 eps와 동일한 지수감쇠로 q_init→q_end, r_init→r_end 스케줄
                 sp['current_q_std'] = cfg.q_end + (cfg.q_init - cfg.q_end) * decay_factor
                 sp['current_r_std'] = cfg.r_end + (cfg.r_init - cfg.r_end) * decay_factor
+                # [IS-R] β: start→end 증가 annealing (decay_factor: 1→0). 후반 불편보정 강화.
+                sp['current_per_beta'] = cfg.per_beta_end + (cfg.per_beta_start - cfg.per_beta_end) * decay_factor
             
             with torch.no_grad():
                 s_t_buffer.copy_(torch.as_tensor(s, dtype=DTYPE))
@@ -5470,6 +5535,9 @@ def train_srrhuif():
             sat_marker = " 🔔BUF_SATURATED" if just_saturated else ""
             
             prefix_tag = "[RHUKF]" if is_rhukf else "[SRRHUIF]"
+            # PER 상태를 prefix에 노출 (PERis=IS-R, PER=샘플링만, 무표시=off)
+            if cfg.use_per:
+                prefix_tag += "[PERis]" if cfg.per_apply_is_weight else "[PER]"
             
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | Q_std: {sp.get('current_q_std', cfg.q_init):.1e} | R_std: {sp.get('current_r_std', cfg.r_init):.1e} | P_avg: {avg_P_ep:.4f} (P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
