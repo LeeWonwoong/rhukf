@@ -141,8 +141,8 @@ def set_all_seeds(seed: int):
 torch.set_default_dtype(torch.float32)
 DTYPE = torch.float32
 DTYPE_FWD = torch.float32
-JITTER = 1e-7
-JITTER_TRIA = 1e-7
+JITTER = 1e-6
+JITTER_TRIA = 1e-6
 
 # ── Fallback 발동 횟수 카운터 (수치적 안정성 진단용) ──
 #   chol_1e5: Cholesky(1e-6 jitter) 실패 → 1e-5 jitter 재시도 횟수
@@ -169,7 +169,7 @@ ENV_CONFIGS: Dict[str, Dict] = {
     "CartPole-v1": {
         "obs_scale": [2.4, 3.0, 0.21, 2.0],
         "max_steps": 500,
-        "max_episodes": 150,
+        "max_episodes": 120,
         "eps_decay_steps": 2000,
         "buffer_size": 50000,
         "results_dir": "results_cartpole",
@@ -210,7 +210,7 @@ class Config:
 
     # [TF32] NN forward(matmul/bmm)만 TF32 허용, 필터 행렬연산은 FP32 유지.
     #   Ampere+ (compute capability ≥ 8.0) GPU에서만 실제로 효과. CPU/구형 GPU면 무시(FP32).
-    use_tf32_forward: bool = True
+    use_tf32_forward: bool = False
     max_episodes: int = 200
     max_steps: int = 500
 
@@ -252,16 +252,25 @@ class Config:
     #   'online_frozen'  = θ_active (호라이즌 시작 직전 동결) argmax (표준 DDQN, 완전 캐싱) ★권장
     #   'online_moving'  = θ_anchor + Δμ^{h-1} argmax (매 h마다 갱신, 캐싱 불가, ablation용)
     #   'spas'           = Sigma-point ensemble argmax (sigma around θ_anchor, mean Q),  θ 하나의 max-bias를 sigma ensemble 평균으로 완화. 캐싱 가능.
-    ddqn_argmax: str = 'online_moving'
+    ddqn_argmax: str = 'online_frozen'
 
     # [v9+: online_moving h=0 초기화] ddqn_argmax='online_moving'에서 호라이즌 첫 스텝(h=0)의
     # argmax 정책. h≥1에서는 항상 θ_anchor + Δμ^{h-1} 사용.
     #   'prev_est'     = 직전 호라이즌 종료 시점 active θ (horizon 직전 theta_active)
     #   'theta_target' = θ_target (보수적, target net 안정성 활용)
     #   'spas'         = sigma-point ensemble mean argmax (FV 전용)
-    h0_online_moving_init: str = 'theta_target'
+    h0_online_moving_init: str = 'prev_est'
     
     use_twin: bool = False  # ★ Overestimation 구조적 해결: 페널티 c 없이 min으로 안전 (TD3 식)
+
+    # ── Soft Q-learning (soft Bellman 타깃; actor 없음, critic만, 정책=softmax(Q/τ)) ──
+    use_soft_q: bool = False           # True면 타깃의 행동 집계 max→soft
+    soft_q_tau: float = 1.0            # 시작 temperature (CartPole Q~10 → 0.2~1 권장)
+    soft_q_tau_end: float = 0.2        # anneal 종료값
+    soft_q_anneal: bool = True         # 학습 진행에 따라 τ 감쇠 (ε처럼)
+    soft_target_mode: str = 'expected' # 'expected'(double-DQN softmax가중) | 'logsumexp'(soft-optimal)
+    soft_behavior: bool = False        # 행동 선택도 softmax 샘플링(탐험용, 타깃과 별개)
+    _soft_tau_now: float = 1.0         # 런타임 현재 τ (내부용; 매 에피소드 갱신)
 
     use_residual: bool = False
     use_residual_auto_depth: Optional[int] = 3   # 3 hidden 이상이면 auto-on
@@ -273,7 +282,7 @@ class Config:
     #   'init'   = 학습 시작시 frozen된 θ_init (RHE/FIR 정신에 더 가까움)
     h0_prior_source: str = 'target'
     
-    shared_layers: List[int] = field(default_factory=lambda: [32,32])   # [] = no hidden shared layers
+    shared_layers: List[int] = field(default_factory=lambda: [24,24])   # [] = no hidden shared layers
     value_layers: List[int] = field(default_factory=lambda: [])
     advantage_layers: List[int] = field(default_factory=lambda: [])
     q_layers: List[int] = field(default_factory=lambda: [])        # [] = sing le linear layer (dimS → nA)
@@ -293,23 +302,23 @@ class Config:
     init_scheme: str = 'he' #xavier
 
     buffer_size: int = 50000
-    batch_size: int = 256
-    N_horizon: int = 6
+    batch_size: int = 128
+    N_horizon: int = 7
     
     q_init: float = 1e-2
     q_end: float = 1e-2
 
-    r_init: float = 1.0
-    r_end: float = 1.0
+    r_init: float = 1.5
+    r_end: float = 1.5
     huber_c: float = 1000
     
     tikhonov_lambda: float = 1e-8
 
     p_init: float = 0.05
-    p_delta_init: float = 0.03
+    p_delta_init: float = 0.05
     
     alpha: float = 0.3
-    beta: float = 2.0
+    beta: float = 3.0
     kappa: float = 0.0
     
     use_n_step: bool = True
@@ -328,9 +337,17 @@ class Config:
 
     warmup_step : int = 0
 
-    train_mode: str = 'filter' #filter or adam
+    train_mode: str = 'compare' # 'filter'(RHUKF) | 'adam'(DDQN baseline) | 'compare'(둘 다 실행→비교 결과 내보냄)
     use_adam_warmup: bool = False
-    adam_lr: float = 1e-3
+    adam_lr: float = 3e-4
+    # ── 공정 튜닝된 Adam-DDQN baseline 전용 하이퍼파라미터 ──
+    #   공유 tau_srrhuif(0.02)/update_interval(4)는 RHUKF용이라 Adam엔 적대적.
+    #   train_mode='adam'에선 아래 표준 DDQN 값을 사용 (τ=0.005 Polyak, 매 스텝 업데이트, lr=1e-3, FP32).
+    adam_tau: float = 0.005            # Adam soft target Polyak 계수 (표준 DDQN)
+    adam_update_interval: int = 1      # Adam은 매 env 스텝 업데이트
+    adam_force_fp32: bool = True       # Adam baseline은 TF32 끄고 FP32 (공정성/재현성)
+    adam_lr_end: float = 5e-5          # lr anneal 종료값 (adam_lr → adam_lr_end, geometric 감쇠)
+    adam_lr_anneal: bool = True        # 에피소드 진행에 따라 Adam lr 감쇠
 
     eps_start: float = 1.0
     eps_end: float = 0.01
@@ -339,7 +356,7 @@ class Config:
     max_layer_step: float = 0.0
     max_k_gain: float = 0.0
 
-    use_spas: bool =  True
+    use_spas: bool = False
 
     use_input_norm: bool = True
     use_compile: bool = True
@@ -347,8 +364,6 @@ class Config:
     log_interval : int = 1
 
     # [video] RecordVideo 백그라운드(headless rgb_array) 녹화
-    #   record_video=True 면 매 video_interval 에피소드마다 현재 θ로 greedy rollout 1판을
-    #   mp4로 저장. 학습 env와 분리된 별도 env에서 돌아가므로 학습/카운트에 영향 없음.
     record_video: bool = True
     video_interval: int = 100           # 매 N 에피소드마다 1개 녹화 (ep % N == 0)
     video_dir: Optional[str] = None    # None이면 {outdir}/videos
@@ -492,6 +507,10 @@ class Config:
             raise ValueError(
                 f"ddqn_argmax='{self.ddqn_argmax}' invalid. Must be one of {valid_argmax}."
             )
+        if self.soft_target_mode not in {'expected', 'logsumexp'}:
+            raise ValueError(
+                f"soft_target_mode='{self.soft_target_mode}' invalid. Must be 'expected' or 'logsumexp'."
+            )
         valid_h0_om = {'prev_est', 'theta_target', 'spas'}
         if self.h0_online_moving_init not in valid_h0_om:
             raise ValueError(
@@ -526,7 +545,7 @@ class Config:
                 )
         
         # [v9+] Train mode 검증
-        valid_train_mode = {'filter', 'adam'}
+        valid_train_mode = {'filter', 'adam', 'compare'}
         if self.train_mode not in valid_train_mode:
             raise ValueError(
                 f"train_mode='{self.train_mode}' invalid. Must be one of {valid_train_mode}."
@@ -585,16 +604,18 @@ class Config:
         # [LunarLander wind] wind 켜면 결과가 섞이지 않도록 태그 추가
         wind_tag = (f"_wind{self.wind_power:g}t{self.turbulence_power:g}"
                     if (self.enable_wind and self.env_name.startswith("LunarLander")) else "")
+        # [soft-Q] 폴더 구분용 태그
+        soft_tag = f"_softT{self.soft_q_tau:g}" if self.use_soft_q else ""
         # [v9+] Train mode tag (filter는 생략, adam은 명시)
         if self.train_mode == 'adam':
             # Adam은 항상 q_target form만 사용 → meas_tag는 폴더명에 포함 안 함
             self.param_str = (
-                f"ADAM_lr{self.adam_lr:g}{per_tag}_{duel_str}_{self.init_scheme}_"
+                f"ADAM_lr{self.adam_lr:g}{per_tag}{soft_tag}_{duel_str}_{self.init_scheme}_"
                 f"b{self.batch_size}_{nstep_str}_s{self.network_seed}"
             )
         else:
             self.param_str = (
-                f"{self.decoupling_mode}_{form_str}_{state_tag}_{meas_tag}{per_tag}{adam_tag}{wind_tag}_{duel_str}_{self.init_scheme}_"
+                f"{self.decoupling_mode}_{form_str}_{state_tag}_{meas_tag}{per_tag}{adam_tag}{wind_tag}{soft_tag}_{duel_str}_{self.init_scheme}_"
                 f"h0_{self.h0_prior_source}_a{self.alpha}_r{self.r_init}_"
                 f"p{self.p_init}_pd{self.p_delta_init}_b{self.batch_size}_{nstep_str}_s{self.network_seed}"
             )
@@ -735,6 +756,18 @@ parser.add_argument('--use_twin', dest='use_twin', action='store_true', default=
                     help="Twin-Q (Clipped Double Q-Learning). 두 독립 (θ_1, θ_2)로 min target.")
 parser.add_argument('--no_twin', dest='use_twin', action='store_false',
                     help="Twin-Q 비활성")
+parser.add_argument('--use_soft_q', dest='use_soft_q', action='store_true', default=cfg.use_soft_q,
+                    help="soft Bellman 타깃(max→soft). actor 없음, critic만.")
+parser.add_argument('--no_soft_q', dest='use_soft_q', action='store_false',
+                    help="soft-Q 비활성 (하드 argmax 타깃)")
+parser.add_argument('--soft_q_tau', type=float, default=cfg.soft_q_tau)
+parser.add_argument('--soft_q_tau_end', type=float, default=cfg.soft_q_tau_end)
+parser.add_argument('--no_soft_anneal', dest='soft_q_anneal', action='store_false',
+                    default=cfg.soft_q_anneal)
+parser.add_argument('--soft_target_mode', type=str, default=cfg.soft_target_mode,
+                    choices=['expected', 'logsumexp'])
+parser.add_argument('--soft_behavior', dest='soft_behavior', action='store_true', default=cfg.soft_behavior,
+                    help="행동 선택도 softmax 샘플링 (탐험용, 타깃과 별개)")
 parser.add_argument('--activation_fn', type=str, default=cfg.activation_fn,
                     choices=['tanh', 'relu', 'leaky_relu', 'mish', 'gelu', 'silu'],
                     help="히든 레이어 활성화 함수")
@@ -754,14 +787,24 @@ parser.add_argument('--advantage_layers', type=int, nargs='*', default=None,
 parser.add_argument('--q_layers', type=int, nargs='*', default=None,
                     help="Q head hidden layer sizes (non-dueling 시)")
 parser.add_argument('--train_mode', type=str, default=cfg.train_mode,
-                    choices=['filter', 'adam'],
-                    help="[v9+] 'filter'=SRRHUKF/RHUKF (기존), 'adam'=순수 Adam DDQN (compare용)")
+                    choices=['filter', 'adam', 'compare'],
+                    help="[v9+] 'filter'=SRRHUKF/RHUKF, 'adam'=순수 Adam DDQN, 'compare'=둘 다 돌려 비교 결과 내보냄")
 parser.add_argument('--use_adam_warmup', dest='use_adam_warmup', action='store_true', default=cfg.use_adam_warmup,
                     help="[v9+] batch_hist가 가득 차기 전(filter 시작 전) 구간에 Adam으로 θ 업데이트")
 parser.add_argument('--no_adam_warmup', dest='use_adam_warmup', action='store_false',
                     help="Adam warm-up 비활성 (기존 동작: 윈도우 채우는 동안 θ 변화 없음)")
 parser.add_argument('--adam_lr', type=float, default=cfg.adam_lr,
                     help="[v9+] Adam warm-up learning rate (default %(default)s)")
+parser.add_argument('--adam_tau', type=float, default=cfg.adam_tau,
+                    help="공정 Adam-DDQN baseline soft target Polyak τ (default %(default)s)")
+parser.add_argument('--adam_lr_end', type=float, default=cfg.adam_lr_end,
+                    help="Adam lr anneal 종료값 (default %(default)s; adam_lr→adam_lr_end geometric)")
+parser.add_argument('--no_adam_lr_anneal', dest='adam_lr_anneal', action='store_false',
+                    default=cfg.adam_lr_anneal, help="Adam lr 스케줄 비활성 (고정 lr)")
+parser.add_argument('--adam_update_interval', type=int, default=cfg.adam_update_interval,
+                    help="Adam baseline env 스텝당 업데이트 주기 (default %(default)s)")
+parser.add_argument('--no_adam_fp32', dest='adam_force_fp32', action='store_false', default=cfg.adam_force_fp32,
+                    help="Adam baseline에서 TF32 강제 비활성 해제 (기본은 FP32 강제)")
 args, _ = parser.parse_known_args()
 
 cfg.env_name = args.env
@@ -829,12 +872,24 @@ cfg.ddqn_argmax = args.ddqn_argmax
 cfg.h0_online_moving_init = args.h0_online_moving_init
 cfg.p_delta_init = args.p_delta_init
 cfg.use_twin = args.use_twin
+cfg.use_soft_q       = args.use_soft_q
+cfg.soft_q_tau       = args.soft_q_tau
+cfg.soft_q_tau_end   = args.soft_q_tau_end
+cfg.soft_q_anneal    = args.soft_q_anneal
+cfg.soft_target_mode = args.soft_target_mode
+cfg.soft_behavior    = args.soft_behavior
+cfg._soft_tau_now    = args.soft_q_tau
 cfg.activation_fn = args.activation_fn
 cfg.node_layer_other_source = args.node_layer_other_source
 cfg.use_residual = args.use_residual
 cfg.train_mode = args.train_mode
 cfg.use_adam_warmup = args.use_adam_warmup
 cfg.adam_lr = args.adam_lr
+cfg.adam_tau = args.adam_tau
+cfg.adam_update_interval = args.adam_update_interval
+cfg.adam_force_fp32 = args.adam_force_fp32
+cfg.adam_lr_end = args.adam_lr_end
+cfg.adam_lr_anneal = args.adam_lr_anneal
 
 if args.shared_layers is not None:
     cfg.shared_layers = args.shared_layers
@@ -2402,7 +2457,13 @@ def srrhuif_step(theta_current_in, theta_target, filter_S_info, batch, sp,
         Q_curr = forward_single(theta_current.squeeze(), info, s_next)
         a_best_next = Q_curr.argmax(dim=0)
 
-    q_val_next = Q_tgt[a_best_next, torch.arange(batch_sz, device=device)].to(DTYPE)
+    # [soft-Q] 직접 gather 대신 soft 가중기대 (τ→0이면 하드 argmax 복원)
+    if cfg.use_soft_q:
+        Q_select = (Q_sigma_f32.mean(dim=0) if (is_first and cfg.use_spas)
+                    else (Q_tgt if is_first else Q_curr))
+        q_val_next = soft_next_value(Q_select, Q_tgt, cfg._soft_tau_now, cfg.soft_target_mode).to(DTYPE)
+    else:
+        q_val_next = Q_tgt[a_best_next, torch.arange(batch_sz, device=device)].to(DTYPE)
 
     # [N-step] target gamma
     target_gamma = (cfg.gamma ** cfg.n_step_size) if cfg.use_n_step else cfg.gamma
@@ -2679,9 +2740,16 @@ def srrhuif_step_fv(theta_current_in, theta_target, filter_S_info, batch, sp,
         Q_curr = forward_single(theta_pred_flat, info, s_next)  # [nA, batch_sz]
         a_best_next = Q_curr.argmax(dim=0)
 
+    # [soft-Q] 타깃 행동 집계용 softmax 가중치 (select net = argmax에 쓰던 그 텐서, no-grad)
+    soft_w = None
+    if cfg.use_soft_q:
+        Q_select = (Q_sigma_next_cache.mean(dim=0) if (is_first and cfg.use_spas)
+                    else (Q_tgt if is_first else Q_curr))
+        soft_w = soft_weights(Q_select, cfg._soft_tau_now)
+
     # [N-step] target_gamma = γ^n_step_size if use_n_step else γ
     target_gamma = (cfg.gamma ** cfg.n_step_size) if cfg.use_n_step else cfg.gamma
-    
+
     # [v9+] Mode-dispatched: Z_sigma_T 변형 + z_measured 계산
     Z_sigma_T, z_measured, _ = _resolve_measurement(
         Q_sigma_at_s_a=Z_sigma_T,
@@ -2690,7 +2758,7 @@ def srrhuif_step_fv(theta_current_in, theta_target, filter_S_info, batch, sp,
         reward=batch['r'], term_mask=batch['term'],
         target_gamma=target_gamma, device=device,
         Q_sigma_next_cache=Q_sigma_next_cache,
-        fwd_fn=forward_bmm,
+        fwd_fn=forward_bmm, soft_w=soft_w,
     )
     target_var = torch.var(z_measured).item()
     
@@ -2902,9 +2970,16 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
     else:
         Q_curr = forward_single(theta_pred_flat, info, s_next)
         a_best_next = Q_curr.argmax(dim=0)
-    
+
+    # [soft-Q] 타깃 행동 집계용 softmax 가중치 (select net = argmax에 쓰던 그 텐서, no-grad)
+    soft_w = None
+    if cfg.use_soft_q:
+        Q_select = (Q_sigma_next_cache.mean(dim=0) if (is_first and cfg.use_spas)
+                    else (Q_tgt if is_first else Q_curr))
+        soft_w = soft_weights(Q_select, cfg._soft_tau_now)
+
     target_gamma = (cfg.gamma ** cfg.n_step_size) if cfg.use_n_step else cfg.gamma
-    
+
     # [v9+] Mode-dispatched: Z_sigma_T 변형 + z_measured 계산
     Z_sigma_T, z_measured, _ = _resolve_measurement(
         Q_sigma_at_s_a=Z_sigma_T,
@@ -2913,7 +2988,7 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
         reward=batch['r'], term_mask=batch['term'],
         target_gamma=target_gamma, device=device,
         Q_sigma_next_cache=Q_sigma_next_cache,
-        fwd_fn=forward_bmm,
+        fwd_fn=forward_bmm, soft_w=soft_w,
     )
     target_var = torch.var(z_measured).item()
     
@@ -3151,9 +3226,13 @@ def compute_adam_td_loss(theta_param, theta_target, batch, sp, cfg):
     # DDQN target — argmax는 online θ로, value는 θ_T로. 모두 grad 차단.
     with torch.no_grad():
         Q_next_nograd = forward_single(theta_param.detach(), info, s_next).to(DTYPE)
-        a_star = Q_next_nograd.argmax(dim=0)
         Q_tgt_next = forward_single(theta_target.squeeze(), info, s_next).to(DTYPE)
-        y = r + target_gamma * (1.0 - term) * Q_tgt_next[a_star, idx_arange]
+        if cfg.use_soft_q:
+            q_next = soft_next_value(Q_next_nograd, Q_tgt_next, cfg._soft_tau_now, cfg.soft_target_mode)
+        else:
+            a_star = Q_next_nograd.argmax(dim=0)
+            q_next = Q_tgt_next[a_star, idx_arange]
+        y = r + target_gamma * (1.0 - term) * q_next
     residual = q_sa - y
 
     if cfg.huber_c > 0:
@@ -3215,6 +3294,25 @@ def _compute_per_priorities(theta, theta_target, batch_hist, sp, cfg, normalizer
     return idx_all, td.abs()
 
 
+def soft_next_value(Q_select, Q_eval, tau, mode='expected'):
+    """next-state soft value. 하드 'Q_eval[argmax(Q_select)]'를 대체.
+    Q_select, Q_eval: [nA, B] (target net 값, no-grad). returns: [B].
+      'expected'  : double-DQN softmax 가중기대  v = Σ_a softmax(Q_select/τ)_a · Q_eval_a
+      'logsumexp' : soft-optimal value (단일 net) v = τ·logsumexp(Q_eval/τ)
+    τ→0 → 하드 argmax 복원. (softmax/logsumexp는 내부 max-subtract로 수치 안정)
+    """
+    tau = max(float(tau), 1e-6)
+    if mode == 'logsumexp':
+        return tau * torch.logsumexp(Q_eval / tau, dim=0)        # [B]
+    w = torch.softmax(Q_select / tau, dim=0)                     # [nA, B]
+    return (w * Q_eval).sum(dim=0)                               # [B]
+
+
+def soft_weights(Q_select, tau):
+    """[nA, B] softmax 가중치. _resolve_measurement 내부 gather 대체용 (no-grad 텐서 입력)."""
+    return torch.softmax(Q_select / max(float(tau), 1e-6), dim=0)
+
+
 def _resolve_measurement(
     Q_sigma_at_s_a,         # [num_sigma, B] — Q(s, a; chi_i)  (이미 계산됨)
     unified_sigma,          # [num_sigma, n_x] — sigma points (pure_reward 시 필요)
@@ -3229,6 +3327,7 @@ def _resolve_measurement(
     Q_sigma_next_cache=None,   # [num_sigma, nA, B] 캐시 (SPAS 등에서 이미 계산했으면 재사용)
     fwd_fn=None,               # forward 함수 (보통 forward_bmm)
     q_val_next_override=None,  # Twin-Q 등에서 min(Q1, Q2) 외부 주입용 (q_target 모드 전용)
+    soft_w=None,               # [nA, B] softmax 가중치 (soft-Q). None이면 하드 argmax gather
 ):
     """
     [v9+] Mode-dispatched measurement / target computation.
@@ -3256,6 +3355,8 @@ def _resolve_measurement(
         Z_sigma_T = Q_sigma_at_s_a  # 그대로
         if q_val_next_override is not None:
             q_val_next = q_val_next_override.to(dtype_z)
+        elif soft_w is not None:
+            q_val_next = (soft_w * Q_tgt_next).sum(dim=0).to(dtype_z)        # soft 가중기대
         else:
             q_val_next = Q_tgt_next[a_best_next, idx].to(dtype_z)
         z_measured = (reward.to(dtype_z) + target_gamma * not_term * q_val_next).view(-1, 1)
@@ -3267,8 +3368,12 @@ def _resolve_measurement(
             if fwd_fn is None:
                 raise ValueError("pure_reward 모드는 Q_sigma_next_cache 또는 fwd_fn 필요")
             Q_sigma_next_cache = fwd_fn(unified_sigma, info, s_next)  # [num_sigma, nA, B]
-        # 각 sigma point의 Q(s', a*; chi) gather
-        q_next_per_sigma = Q_sigma_next_cache[:, a_best_next, idx].to(dtype_z)  # [num_sigma, B]
+        # 각 sigma point의 Q(s', a*; chi) gather (soft면 시그마 축으로 가중합)
+        if soft_w is not None:
+            # Q_sigma_next_cache: [num_sigma, nA, B], soft_w: [nA, B]
+            q_next_per_sigma = (Q_sigma_next_cache * soft_w.unsqueeze(0)).sum(dim=1).to(dtype_z)
+        else:
+            q_next_per_sigma = Q_sigma_next_cache[:, a_best_next, idx].to(dtype_z)  # [num_sigma, B]
         # terminal masking
         q_next_per_sigma = q_next_per_sigma * not_term.unsqueeze(0)
         Z_sigma_T = Q_sigma_at_s_a - target_gamma * q_next_per_sigma
@@ -5091,6 +5196,8 @@ def train_srrhuif():
             print(f"  PER: ON (alpha={cfg.per_alpha:g}) | IS-R: off → Huber-adaptive R (c={cfg.huber_c:g})")
     else:
         print(f"  PER: off (uniform sampling, Huber-adaptive R, c={cfg.huber_c:g})")
+    if cfg.use_soft_q:
+        print(f"  Soft-Q: ON | mode={cfg.soft_target_mode} | τ={cfg.soft_q_tau}->{cfg.soft_q_tau_end} (anneal={cfg.soft_q_anneal}) | behavior={cfg.soft_behavior}")
     print(f"  Output Dir: {cfg.outdir}")
     print(f"  Seeds: network={net_seed}, env={env_seed}")
     print(f"{'='*60}\n")
@@ -5221,6 +5328,13 @@ def train_srrhuif():
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=env_seed + ep)
         buffer.set_current_episode(ep)
+        # [soft-Q] τ annealing (ε처럼 학습 진행에 따라 감쇠)
+        if cfg.use_soft_q:
+            if cfg.soft_q_anneal:
+                frac = min(1.0, ep / max(1, cfg.max_episodes - 1))
+                cfg._soft_tau_now = cfg.soft_q_tau + frac * (cfg.soft_q_tau_end - cfg.soft_q_tau)
+            else:
+                cfg._soft_tau_now = cfg.soft_q_tau
         
         ep_r, ep_l, ep_var, ep_k_gain, ep_start = 0, [], [], [], time.time()
         ep_q0, ep_q1 = [], []
@@ -5265,7 +5379,14 @@ def train_srrhuif():
                 ep_q0.append(q_vals[0].item())
                 ep_q1.append(q_vals[1].item())
 
-            a = env.action_space.sample() if np.random.rand() < eps else q_vals.argmax().item()
+            if np.random.rand() < eps:
+                a = env.action_space.sample()
+            elif cfg.use_soft_q and cfg.soft_behavior:
+                # [soft-Q] softmax(Q/τ) 샘플링 탐험 (타깃 kink 수정과 독립)
+                p_beh = torch.softmax(q_vals / max(cfg._soft_tau_now, 1e-6), dim=0)
+                a = int(torch.multinomial(p_beh, 1).item())
+            else:
+                a = int(q_vals.argmax().item())
             ns, r, done, trunc, _ = env.step(a)
             buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
@@ -5707,8 +5828,13 @@ def train_srrhuif():
     try:
         plot_cartpole_state_landscape(theta, info, cfg, normalizer, method_title, cfg.param_str)
     except Exception as e: print(f"[경고] 지형도 생성 중 오류 발생: {e}")
-        
+
     logger.close()
+    return {  # [compare] 비교 하네스용 메트릭
+        'label': 'RHUKF', 'rewards': list(logger.rewards), 'losses': list(logger.losses),
+        'avg_update_ms': logger.avg_step_time, 'total_time': logger.total_time,
+        'param_str': cfg.param_str, 'outdir': cfg.outdir,
+    }
 
 
 # =========================================================================
@@ -5723,6 +5849,9 @@ def train_adam():
     net_seed = cfg.network_seed if cfg.network_seed is not None else cfg.seed
     env_seed = cfg.env_seed if cfg.env_seed is not None else cfg.seed
     set_all_seeds(net_seed)
+    # [공정 Adam baseline] TF32 끄고 FP32 강제 (공정성/재현성)
+    if cfg.adam_force_fp32:
+        cfg.use_tf32_forward = False
     apply_tf32_config(cfg)  # cfg가 코드에서 바뀐 경우에도 반영 (idempotent)
     env = gym.make(cfg.env_name, **build_env_kwargs(cfg))
     env.action_space.seed(net_seed)
@@ -5734,10 +5863,15 @@ def train_adam():
     print(f"\n{'='*60}")
     print(f"  Pure Adam {method_title} v9.0 (compare mode)")
     print(f"  loss form: q_target (semi-gradient TD, always — pure_reward는 Adam 비호환)")
-    print(f"  lr={cfg.adam_lr:g} | huber_c={cfg.huber_c} | batch={cfg.batch_size}")
+    _lr_sched = f"{cfg.adam_lr:g}->{cfg.adam_lr_end:g} (anneal)" if cfg.adam_lr_anneal else f"{cfg.adam_lr:g} (fixed)"
+    print(f"  lr={_lr_sched} | huber_c={cfg.huber_c} | batch={cfg.batch_size}")
+    print(f"  [공정 baseline] target: SOFT Polyak τ={cfg.adam_tau:g} | update_interval={cfg.adam_update_interval} "
+          f"| precision={'FP32' if cfg.adam_force_fp32 else 'TF32-allowed'}")
     if cfg.measurement_mode == 'pure_reward':
         print(f"  NOTE: cfg.measurement_mode='pure_reward' 설정돼 있으나 무시하고 q_target 사용.")
     print(f"  Params: {info['total_params']} | Output Dir: {cfg.outdir}")
+    if cfg.use_soft_q:
+        print(f"  Soft-Q: ON | mode={cfg.soft_target_mode} | τ={cfg.soft_q_tau}->{cfg.soft_q_tau_end} (anneal={cfg.soft_q_anneal})")
     print(f"  Seeds: network={net_seed}, env={env_seed}")
     print(f"{'='*60}\n")
 
@@ -5771,6 +5905,22 @@ def train_adam():
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=env_seed + ep)
         buffer.set_current_episode(ep)
+        # [soft-Q] τ annealing (ε처럼 학습 진행에 따라 감쇠)
+        if cfg.use_soft_q:
+            if cfg.soft_q_anneal:
+                frac = min(1.0, ep / max(1, cfg.max_episodes - 1))
+                cfg._soft_tau_now = cfg.soft_q_tau + frac * (cfg.soft_q_tau_end - cfg.soft_q_tau)
+            else:
+                cfg._soft_tau_now = cfg.soft_q_tau
+
+        # [Adam] lr 스케줄: adam_lr → adam_lr_end (에피소드 진행 따라 geometric 감쇠)
+        if cfg.adam_lr_anneal and cfg.max_episodes > 1:
+            _frac = (ep - 1) / (cfg.max_episodes - 1)
+            cur_lr = cfg.adam_lr * (cfg.adam_lr_end / cfg.adam_lr) ** _frac
+        else:
+            cur_lr = cfg.adam_lr
+        for _g in adam_opt.param_groups:
+            _g['lr'] = cur_lr
 
         ep_r, ep_l, ep_start = 0, [], time.time()
         ep_q0, ep_q1 = [], []
@@ -5793,12 +5943,19 @@ def train_adam():
                 ep_q0.append(q_vals[0].item())
                 ep_q1.append(q_vals[1].item())
 
-            a = env.action_space.sample() if np.random.rand() < eps else q_vals.argmax().item()
+            if np.random.rand() < eps:
+                a = env.action_space.sample()
+            elif cfg.use_soft_q and cfg.soft_behavior:
+                # [soft-Q] softmax(Q/τ) 샘플링 탐험 (타깃 kink 수정과 독립)
+                p_beh = torch.softmax(q_vals / max(cfg._soft_tau_now, 1e-6), dim=0)
+                a = int(torch.multinomial(p_beh, 1).item())
+            else:
+                a = int(q_vals.argmax().item())
             ns, r, done, trunc, _ = env.step(a)
             buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
-            if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
+            if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.adam_update_interval == 0:
                 t_upd = time.perf_counter()
                 batch = buffer.sample_batch(cfg.batch_size)
 
@@ -5810,13 +5967,13 @@ def train_adam():
                     theta.data.copy_(theta_param.data.view(-1, 1))
                 ep_l.append(float(loss.detach().item()))
 
-                # target net update
+                # target net update — 공정 Adam baseline: SOFT Polyak τ=adam_tau (표준 DDQN)
                 param_update_count += 1
-                if cfg.target_update_mode == 'soft':
-                    theta_target = (1.0 - cfg.tau_srrhuif) * theta_target + cfg.tau_srrhuif * theta
-                else:
+                if cfg.target_update_mode == 'hard':
                     if param_update_count % cfg.target_update_period == 0:
                         theta_target = theta.clone()
+                else:
+                    theta_target = (1.0 - cfg.adam_tau) * theta_target + cfg.adam_tau * theta
 
                 # PER priority update
                 if cfg.use_per:
@@ -5891,7 +6048,7 @@ def train_adam():
 
             print(f"[ADAM] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} "
                   f"| Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
-                  f"| Loss: {avg_l:.4f} | lr: {cfg.adam_lr:.1e} "
+                  f"| Loss: {avg_l:.4f} | lr: {cur_lr:.1e} "
                   f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} "
                   f"| Updates: {param_update_count} | Time: {time.time()-ep_start:.2f}s")
 
@@ -5951,15 +6108,120 @@ def train_adam():
         print(f"[경고] 지형도 생성 중 오류 발생: {e}")
 
     logger.close()
+    return {  # [compare] 비교 하네스용 메트릭
+        'label': 'ADAM', 'rewards': list(logger.rewards), 'losses': list(logger.losses),
+        'avg_update_ms': logger.avg_step_time, 'total_time': logger.total_time,
+        'param_str': cfg.param_str, 'outdir': cfg.outdir,
+    }
+
+
+# =========================================================================
+# 11c. Comparison harness — RHUKF vs Adam (reward / loss / update-time)
+# =========================================================================
+def _export_comparison(results, compare_dir):
+    """두 모드 메트릭을 CSV + 비교 플롯 + 요약으로 내보냄."""
+    import csv
+    os.makedirs(compare_dir, exist_ok=True)
+    rh, ad = results.get('RHUKF'), results.get('ADAM')
+
+    # ── per-episode CSV ──
+    n = min(len(rh['rewards']), len(ad['rewards'])) if (rh and ad) else 0
+    csv_path = os.path.join(compare_dir, "compare_metrics.csv")
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ep', 'RHUKF_reward', 'RHUKF_loss', 'ADAM_reward', 'ADAM_loss'])
+        for i in range(n):
+            w.writerow([i + 1, rh['rewards'][i], rh['losses'][i], ad['rewards'][i], ad['losses'][i]])
+
+    # ── 요약 (final avg100 reward, 업데이트 시간, 총 시간) ──
+    def _avg_tail(xs, k=100):
+        return float(np.mean(xs[-k:])) if xs else 0.0
+    summary_lines = ["=== RHUKF vs Adam comparison ==="]
+    for label, m in (('RHUKF', rh), ('ADAM', ad)):
+        if m is None: continue
+        summary_lines.append(
+            f"[{label}] final_avg100_reward={_avg_tail(m['rewards']):.1f} | "
+            f"best_reward={max(m['rewards']) if m['rewards'] else 0:.1f} | "
+            f"avg_update={m['avg_update_ms']:.2f} ms | total_wall={m['total_time']:.1f} s | "
+            f"final_loss={m['losses'][-1] if m['losses'] else float('nan'):.4f}")
+    if rh and ad and ad['avg_update_ms'] > 0:
+        summary_lines.append(f"[speed] RHUKF/Adam update-time ratio = {rh['avg_update_ms']/ad['avg_update_ms']:.2f}x "
+                             f"(>1 이면 RHUKF가 업데이트당 더 느림)")
+    summary = "\n".join(summary_lines)
+    print("\n" + summary)
+    with open(os.path.join(compare_dir, "compare_summary.txt"), 'w', encoding='utf-8') as f:
+        f.write(summary + "\n")
+
+    # ── 비교 플롯 (reward MA / loss / 업데이트 시간) ──
+    try:
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        def _ma(xs, k=20):
+            return np.convolve(xs, np.ones(k)/k, 'valid') if len(xs) >= k else np.asarray(xs)
+        ax = axes[0, 0]
+        for label, m, c in (('RHUKF', rh, 'C0'), ('ADAM', ad, 'C1')):
+            if m and m['rewards']:
+                ax.plot(m['rewards'], color=c, alpha=0.25)
+                ma = _ma(m['rewards']); ax.plot(range(len(m['rewards'])-len(ma), len(m['rewards'])), ma, color=c, lw=2, label=label)
+        ax.set_title('Episode Reward (MA20)'); ax.set_xlabel('Episode'); ax.legend(); ax.grid(alpha=0.3)
+        ax = axes[0, 1]
+        for label, m, c in (('RHUKF', rh, 'C0'), ('ADAM', ad, 'C1')):
+            if m and m['losses']: ax.plot(m['losses'], color=c, lw=1.5, label=label)
+        ax.set_yscale('log'); ax.set_title('Loss'); ax.set_xlabel('Episode'); ax.legend(); ax.grid(alpha=0.3)
+        ax = axes[1, 0]
+        labels = [m['label'] for m in (rh, ad) if m]
+        vals = [m['avg_update_ms'] for m in (rh, ad) if m]
+        ax.bar(labels, vals, color=['C0', 'C1'][:len(vals)])
+        ax.set_title('Avg update time (ms)'); ax.grid(alpha=0.3, axis='y')
+        ax = axes[1, 1]
+        labels = [m['label'] for m in (rh, ad) if m]
+        vals = [m['total_time'] for m in (rh, ad) if m]
+        ax.bar(labels, vals, color=['C0', 'C1'][:len(vals)])
+        ax.set_title('Total wall time (s)'); ax.grid(alpha=0.3, axis='y')
+        plt.tight_layout()
+        png = os.path.join(compare_dir, "compare_plot.png")
+        plt.savefig(png, dpi=120, bbox_inches='tight'); plt.close(fig)
+        print(f"[compare] 결과 저장: {csv_path}\n          {png}")
+    except Exception as e:
+        print(f"[compare] 플롯 생성 실패(무시): {type(e).__name__}: {e}")
+
+
+def run_comparison():
+    """RHUKF와 Adam을 동일 seed로 순차 실행하고 비교 결과를 내보낸다.
+    RHUKF 먼저(설정된 TF32), 그 다음 Adam(자체적으로 FP32 강제). cfg는 모드별로 재계산."""
+    saved_tf32 = cfg.use_tf32_forward
+    base_results_dir = None
+    results = {}
+    for label, mode in (('RHUKF', 'filter'), ('ADAM', 'adam')):
+        cfg.use_tf32_forward = saved_tf32      # Adam이 끈 TF32를 RHUKF용으로 복원
+        cfg.train_mode = mode
+        cfg.__post_init__()                    # param_str/outdir를 모드별로 재계산 (폴더 충돌 방지)
+        if base_results_dir is None:
+            base_results_dir = os.path.dirname(cfg.outdir)
+        if cfg.save_file_log:
+            close_file_logging()
+            setup_file_logging(os.path.join(cfg.outdir, "training_log.txt"))
+        print(f"\n{'#'*64}\n##### COMPARE [{label}]  train_mode={mode}\n{'#'*64}")
+        results[label] = train_adam() if mode == 'adam' else train_srrhuif()
+        finalize_videos()
+    if cfg.save_file_log:
+        close_file_logging()
+    compare_dir = os.path.join(base_results_dir or '.', f"_compare_{cfg.env_name}_s{cfg.network_seed}")
+    os.makedirs(compare_dir, exist_ok=True)  # 로그 파일 열기 전에 폴더 먼저 생성
+    if cfg.save_file_log:
+        setup_file_logging(os.path.join(compare_dir, "compare_log.txt"))
+    _export_comparison(results, compare_dir)
 
 
 if __name__ == "__main__":
-    if cfg.save_file_log: setup_file_logging(os.path.join(cfg.outdir, "training_log.txt"))
     try:
-        if cfg.train_mode == 'adam':
-            train_adam()
+        if cfg.train_mode == 'compare':
+            run_comparison()
         else:
-            train_srrhuif()
+            if cfg.save_file_log: setup_file_logging(os.path.join(cfg.outdir, "training_log.txt"))
+            if cfg.train_mode == 'adam':
+                train_adam()
+            else:
+                train_srrhuif()
     finally:
         finalize_videos()
         if cfg.save_file_log: close_file_logging()
