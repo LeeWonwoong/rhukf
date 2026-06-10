@@ -303,22 +303,22 @@ class Config:
 
     buffer_size: int = 50000
     batch_size: int = 128
-    N_horizon: int = 7
+    N_horizon: int = 6
     
     q_init: float = 1e-2
-    q_end: float = 1e-2
+    q_end: float = 1e-3
 
-    r_init: float = 1.5
-    r_end: float = 1.5
+    r_init: float = 3
+    r_end: float = 3
     huber_c: float = 1000
     
     tikhonov_lambda: float = 1e-8
 
     p_init: float = 0.05
-    p_delta_init: float = 0.05
+    p_delta_init: float = 0.2
     
-    alpha: float = 0.3
-    beta: float = 3.0
+    alpha: float = 0.1
+    beta: float = 2.0
     kappa: float = 0.0
     
     use_n_step: bool = True
@@ -337,17 +337,17 @@ class Config:
 
     warmup_step : int = 0
 
-    train_mode: str = 'compare' # 'filter'(RHUKF) | 'adam'(DDQN baseline) | 'compare'(둘 다 실행→비교 결과 내보냄)
+    train_mode: str = 'filter' # 'filter'(RHUKF) | 'adam'(DDQN baseline) | 'compare'(둘 다 실행→비교 결과 내보냄)
     use_adam_warmup: bool = False
-    adam_lr: float = 3e-4
+    adam_lr: float = 5e-4
     # ── 공정 튜닝된 Adam-DDQN baseline 전용 하이퍼파라미터 ──
     #   공유 tau_srrhuif(0.02)/update_interval(4)는 RHUKF용이라 Adam엔 적대적.
     #   train_mode='adam'에선 아래 표준 DDQN 값을 사용 (τ=0.005 Polyak, 매 스텝 업데이트, lr=1e-3, FP32).
     adam_tau: float = 0.005            # Adam soft target Polyak 계수 (표준 DDQN)
     adam_update_interval: int = 1      # Adam은 매 env 스텝 업데이트
     adam_force_fp32: bool = True       # Adam baseline은 TF32 끄고 FP32 (공정성/재현성)
-    adam_lr_end: float = 5e-5          # lr anneal 종료값 (adam_lr → adam_lr_end, geometric 감쇠)
-    adam_lr_anneal: bool = True        # 에피소드 진행에 따라 Adam lr 감쇠
+    adam_lr_end: float = 3e-4          # lr anneal 종료값 (adam_lr → adam_lr_end, geometric 감쇠)
+    adam_lr_anneal: bool = False        # 에피소드 진행에 따라 Adam lr 감쇠
 
     eps_start: float = 1.0
     eps_end: float = 0.01
@@ -369,9 +369,9 @@ class Config:
     video_dir: Optional[str] = None    # None이면 {outdir}/videos
     video_async: bool = True           # True면 데몬 스레드에서 녹화(학습 비차단)
 
-    seed: int = 42
-    network_seed: Optional[int] = 42
-    env_seed: Optional[int] = 42
+    seed: int = 0
+    network_seed: Optional[int] = 0
+    env_seed: Optional[int] = 0
     
     use_full_eigvalsh: bool = True
     diag_ref_states: bool = True
@@ -3071,9 +3071,10 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
     # [J] Diagnostics — covariance form 의미에 맞게
     # ═════════════════════════════════════════════════════════════
     P_diag = torch.diagonal(P_new)
-    avg_P = P_diag.mean().item()
+    avg_P = P_diag.mean().item()                            # 사후 (measurement update 후)
+    avg_P_pred = torch.diagonal(P_pred).mean().item()       # 예측 (process noise 주입 후)
     max_P = P_diag.max().item()
-    
+
     # cond(P_zz) ≈ cond(L_zz)² (cheap proxy)
     L_zz_diag = torch.diagonal(L_zz)
     cond_P_zz = ((L_zz_diag.max() / L_zz_diag.min().clamp(min=1e-12)) ** 2).item()
@@ -3090,8 +3091,9 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
         'resid_in_innov': innov_abs.mean().item(),
         'ht_theta_in_innov': 0.0,
         'avg_P': avg_P,
+        'avg_P_pred': avg_P_pred,  # process noise 주입 후(예측) — 관측 반영 전
         'max_P': max_P,
-        # P_xz는 KF form에서 H^T (cross covariance)의 직접 대응. 
+        # P_xz는 KF form에서 H^T (cross covariance)의 직접 대응.
         # ‖P_xz‖는 측정-상태 민감도 (statistical Jacobian 크기)의 proxy.
         'ht_norm': torch.norm(P_xz).item(),
         'resid_norm': torch.norm(residual).item(),
@@ -3898,7 +3900,8 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     
     # ── Diagnostics ────────────────────────────────────────────────
     P_diag = torch.diagonal(P_delta_new)
-    avg_P = P_diag.mean().item()
+    avg_P = P_diag.mean().item()                                  # 사후 (measurement update 후)
+    avg_P_pred = torch.diagonal(P_delta_pred).mean().item()       # 예측 (process noise 주입 후)
     max_P = P_diag.max().item()
     L_zz_diag = torch.diagonal(L_zz)
     cond_P_zz = ((L_zz_diag.max() / L_zz_diag.min().clamp(min=1e-12)) ** 2).item()
@@ -3913,6 +3916,7 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         'resid_in_innov': innov_abs.mean().item(),
         'ht_theta_in_innov': 0.0,  # KF form: 항상 0 (정보형의 H^T·θ_pred 항 없음)
         'avg_P': avg_P,
+        'avg_P_pred': avg_P_pred,  # process noise 주입 후(예측) — 관측 반영 전
         'max_P': max_P,
         'ht_norm': torch.norm(P_delta_z).item(),
         'resid_norm': torch.norm(residual).item(),
@@ -5340,7 +5344,9 @@ def train_srrhuif():
         ep_q0, ep_q1 = [], []
         ep_i_mean, ep_i_max = [], []
         ep_avg_P = []  # [v6] dbg['avg_P'] 모아서 LivePlotter에 동적 P 추적
-        
+        ep_avg_P_pred = []  # process noise 주입 후(예측) P 평균 — 관측 반영 전
+
+        last_h_p_pred_traj = []  # per-h 예측 P 평균 궤적
         last_h_k_traj, last_h_p_traj, last_h_ht_traj = [], [], []
         last_h_resid_traj, last_h_innov_decomp, last_h_cos_traj = [], [], []
         last_h_layer_ht, last_h_layer_delta = [], []
@@ -5431,6 +5437,7 @@ def train_srrhuif():
                     ep_l.append(float(loss_adam.detach().item()))
 
                 if len(batch_hist) == cfg.N_horizon:
+                    h_p_pred_traj = []  # 예측 P(process noise 후) per-h
                     h_k_traj, h_p_traj, h_ht_traj = [], [], []
                     h_resid_traj, h_resid_in_innov_traj, h_ht_theta_traj = [], [], []
                     h_innov_traj, h_cos_traj = [], []
@@ -5544,8 +5551,10 @@ def train_srrhuif():
                         ep_l.append(l_val); ep_var.append(t_var); ep_k_gain.append(t_k_gain)
                         ep_i_mean.append(dbg['innov_mean']); ep_i_max.append(dbg['innov_max'])
                         ep_avg_P.append(dbg['avg_P'])  # [v6] dynamic P tracking
-                        
+                        ep_avg_P_pred.append(dbg.get('avg_P_pred', dbg['avg_P']))  # 예측 P (없으면 사후로 폴백)
+
                         h_k_traj.append(t_k_gain); h_p_traj.append(dbg['avg_P']); h_ht_traj.append(dbg['ht_norm'])
+                        h_p_pred_traj.append(dbg.get('avg_P_pred', dbg['avg_P']))
                         h_resid_traj.append(dbg['resid_norm']); h_resid_in_innov_traj.append(dbg['resid_in_innov'])
                         h_ht_theta_traj.append(dbg['ht_theta_in_innov']); h_innov_traj.append(dbg['innov_norm'])
                         h_layer_ht.append(dbg['per_layer_ht']); h_layer_delta.append(dbg['per_layer_delta'])
@@ -5602,6 +5611,7 @@ def train_srrhuif():
                             buffer.update_priorities(idx_per, td_per)
                     
                     last_h_k_traj, last_h_p_traj, last_h_ht_traj = h_k_traj, h_p_traj, h_ht_traj
+                    last_h_p_pred_traj = h_p_pred_traj
                     last_h_resid_traj, last_h_cos_traj = h_resid_traj, h_cos_traj
                     last_h_innov_decomp = list(zip(h_resid_in_innov_traj, h_ht_theta_traj, h_innov_traj))
                     last_h_layer_ht, last_h_layer_delta = h_layer_ht, h_layer_delta
@@ -5627,7 +5637,8 @@ def train_srrhuif():
         avg_q1 = np.mean(ep_q1) if ep_q1 else 0
         avg_i_mean = np.mean(ep_i_mean) if ep_i_mean else 0
         max_i_max = np.max(ep_i_max) if ep_i_max else 0
-        avg_P_ep = np.mean(ep_avg_P) if ep_avg_P else cfg.p_init  # [v6] dynamic avg P
+        avg_P_ep = np.mean(ep_avg_P) if ep_avg_P else cfg.p_init  # [v6] dynamic avg P (사후)
+        avg_P_pred_ep = np.mean(ep_avg_P_pred) if ep_avg_P_pred else avg_P_ep  # 예측 (process noise 후)
         
         logger.add(ep_r, avg_l, avg_P_ep, avg_v, avg_k, avg_q0, avg_q1)
         theta_norms = compute_layer_theta_norms(theta, info)
@@ -5687,7 +5698,7 @@ def train_srrhuif():
                 prefix_tag += "[PERis]" if cfg.per_apply_is_weight else "[PER]"
             
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
-                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | Q_std: {sp.get('current_q_std', cfg.q_init):.1e} | R_std: {sp.get('current_r_std', cfg.r_init):.1e} | P_avg: {avg_P_ep:.4f} (P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
+                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | Q_std: {sp.get('current_q_std', cfg.q_init):.1e} | R_std: {sp.get('current_r_std', cfg.r_init):.1e} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
                   f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
 
             # ── [분석 레이어] 핵심 원인 진단(VERDICT) + verbosity gating ──
@@ -5722,7 +5733,9 @@ def train_srrhuif():
                 fmt_e = lambda traj: "[" + ", ".join([f"{v:.2e}" for v in traj]) + "]"
                 fmt2 = lambda traj: "[" + ", ".join([f"{v:+.3f}" for v in traj]) + "]"
                 file_print(f"          └─▶ K_Gain/h:  {fmt(last_h_k_traj)}")
-                file_print(f"          └─▶ P_avg/h:   {fmt_e(last_h_p_traj)}")
+                if last_h_p_pred_traj:
+                    file_print(f"          └─▶ P_pred/h:  {fmt_e(last_h_p_pred_traj)}  (process noise 후, 관측 전)")
+                file_print(f"          └─▶ P_post/h:  {fmt_e(last_h_p_traj)}  (measurement update 후)")
                 if last_h_innov_decomp:
                     file_print(f"          └─▶ |z-ẑ|/h:   {fmt([d[0] for d in last_h_innov_decomp])}")
                     file_print(f"          └─▶ |H^Tθ|/h:  {fmt([d[1] for d in last_h_innov_decomp])}")
