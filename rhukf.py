@@ -171,7 +171,7 @@ ENV_CONFIGS: Dict[str, Dict] = {
         "max_steps": 500,
         "max_episodes": 120,
         "eps_decay_steps": 2000,
-        "buffer_size": 50000,
+        "buffer_size": 20000,
         "results_dir": "results_cartpole",
         "reward_threshold": 195,       # solved 기준 (avg reward)
         "reward_ylim": [0, 520],       # 보상 그래프 y축 (CartPole: 0~500)
@@ -185,7 +185,7 @@ ENV_CONFIGS: Dict[str, Dict] = {
         "buffer_size": 300000,
         "results_dir": "results_lunarlander",
         "reward_threshold": 200,       # solved 기준 (avg reward)
-        "reward_ylim": [-450, 320],    # 보상 그래프 y축 (LunarLander: 음수 추락보상 포함)
+        "reward_ylim": [-200, 320],    # 보상 그래프 y축 (LunarLander: floor -200로 올려 200+ 영역 강조, 깊은 추락은 클리핑)
     },
 }
 
@@ -238,7 +238,6 @@ class Config:
     decoupling_mode: str = 'fv'
 
     filter_form: str = 'covariance' # information or covariance
-    state_form: str = 'error' # absolute or error
     measurement_mode: str = 'q_target' # q_target or pure_reward
     
     # [v7: Anchor type] state_form='error'에서 θ_anchor 결정 방식
@@ -259,7 +258,7 @@ class Config:
     #   'prev_est'     = 직전 호라이즌 종료 시점 active θ (horizon 직전 theta_active)
     #   'theta_target' = θ_target (보수적, target net 안정성 활용)
     #   'spas'         = sigma-point ensemble mean argmax (FV 전용)
-    h0_online_moving_init: str = 'prev_est'
+    h0_online_moving_init: str = 'theta_target'
     
     use_twin: bool = False  # ★ Overestimation 구조적 해결: 페널티 c 없이 min으로 안전 (TD3 식)
 
@@ -292,8 +291,8 @@ class Config:
     gamma: float = 0.9
     scale_factor: float = 1.0
     
-    tau_srrhuif: float = 0.02
-    update_interval: int = 4
+    tau_srrhuif: float = 0.005
+    update_interval: int = 1
     
     target_update_mode: str = 'soft'
     target_update_period: int = 200   # hard mode 시 호라이즌 업데이트 카운트 기준
@@ -306,18 +305,19 @@ class Config:
     N_horizon: int = 6
     
     q_init: float = 1e-2
-    q_end: float = 1e-3
+    q_end: float = 1e-2
 
-    r_init: float = 3
-    r_end: float = 3
+    r_init: float = 1.0
+    r_end: float = 1.0
     huber_c: float = 1000
     
     tikhonov_lambda: float = 1e-8
 
+    state_form: str = 'error' # absolute or error
     p_init: float = 0.05
-    p_delta_init: float = 0.2
+    p_delta_init: float = 0.08
     
-    alpha: float = 0.1
+    alpha: float = 0.9
     beta: float = 2.0
     kappa: float = 0.0
     
@@ -3074,6 +3074,7 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
     avg_P = P_diag.mean().item()                            # 사후 (measurement update 후)
     avg_P_pred = torch.diagonal(P_pred).mean().item()       # 예측 (process noise 주입 후)
     max_P = P_diag.max().item()
+    min_P = P_diag.min().item()
 
     # cond(P_zz) ≈ cond(L_zz)² (cheap proxy)
     L_zz_diag = torch.diagonal(L_zz)
@@ -3093,6 +3094,7 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
         'avg_P': avg_P,
         'avg_P_pred': avg_P_pred,  # process noise 주입 후(예측) — 관측 반영 전
         'max_P': max_P,
+        'min_P': min_P,
         # P_xz는 KF form에서 H^T (cross covariance)의 직접 대응.
         # ‖P_xz‖는 측정-상태 민감도 (statistical Jacobian 크기)의 proxy.
         'ht_norm': torch.norm(P_xz).item(),
@@ -3903,6 +3905,7 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     avg_P = P_diag.mean().item()                                  # 사후 (measurement update 후)
     avg_P_pred = torch.diagonal(P_delta_pred).mean().item()       # 예측 (process noise 주입 후)
     max_P = P_diag.max().item()
+    min_P = P_diag.min().item()
     L_zz_diag = torch.diagonal(L_zz)
     cond_P_zz = ((L_zz_diag.max() / L_zz_diag.min().clamp(min=1e-12)) ** 2).item()
     k_gain_norm = torch.norm(K).item()
@@ -3918,6 +3921,7 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         'avg_P': avg_P,
         'avg_P_pred': avg_P_pred,  # process noise 주입 후(예측) — 관측 반영 전
         'max_P': max_P,
+        'min_P': min_P,
         'ht_norm': torch.norm(P_delta_z).item(),
         'resid_norm': torch.norm(residual).item(),
         'delta_y': torch.norm(K @ residual).item(),
@@ -4434,6 +4438,7 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
     #   루프 종료 후 1회만 변환한다. (수학 불변)
     _labels, _ht_t, _kn_t, _resid_t, _deltac_t = [], [], [], [], []
     _innovmean_t, _innovmax_t, _avgP_t = [], [], []
+    _maxP_t, _minP_t = [], []
     z_abs_max = torch.max(torch.abs(z_measured)).item()  # 레이어 무관 → 1회만
 
     for L in range(info['num_filter_layers']):
@@ -4522,7 +4527,10 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         _resid_t.append(torch.norm(residual))
         _innovmean_t.append(res_abs.mean())
         _innovmax_t.append(res_abs.max())
-        _avgP_t.append(torch.diagonal(P_new, dim1=-2, dim2=-1).mean())
+        _Pd = torch.diagonal(P_new, dim1=-2, dim2=-1)
+        _avgP_t.append(_Pd.mean())
+        _maxP_t.append(_Pd.max())
+        _minP_t.append(_Pd.min())
 
     # [opt] 진단 스칼라 1회 변환 (레이어당 ~7 sync → 메트릭당 1 sync)
     ht_v = torch.stack(_ht_t).tolist()
@@ -4532,6 +4540,8 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
     innovmean_v = torch.stack(_innovmean_t).tolist()
     innovmax_v = torch.stack(_innovmax_t).tolist()
     avgP_v = torch.stack(_avgP_t).tolist()
+    maxP_v = torch.stack(_maxP_t).tolist()
+    minP_v = torch.stack(_minP_t).tolist()
 
     total_innov_mean = float(np.sum(innovmean_v))
     total_innov_max = float(np.max(innovmax_v))
@@ -4576,7 +4586,8 @@ def rhukf_step(theta_current_in, theta_target, filter_P_cov_list, batch, sp,
         'ht_norm': total_ht_norm / layer_count,
         'resid_norm': total_resid_norm / layer_count,
         'avg_P': total_avg_P / layer_count,
-        'max_P': total_avg_P / layer_count,
+        'max_P': float(np.max(maxP_v)),
+        'min_P': float(np.min(minP_v)),
         'delta_y': total_delta_norm,
         'y_pred_norm': torch.norm(z_measured).item(),
         'y_new': 0.0,
@@ -4738,6 +4749,7 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
     #   모았다가 루프 종료 후 1회만 .tolist()로 변환한다. (수학은 불변)
     _labels, _ht_t, _kn_t, _resid_t, _deltac_t = [], [], [], [], []
     _innovmean_t, _innovmax_t, _avgP_t = [], [], []
+    _maxP_t, _minP_t = [], []
     z_abs_max = torch.max(torch.abs(z_measured)).item()  # 레이어 무관 → 1회만
 
     for L in range(info['num_filter_layers']):
@@ -4807,7 +4819,10 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         _resid_t.append(torch.norm(residual))
         _innovmean_t.append(res_abs.mean())
         _innovmax_t.append(res_abs.max())
-        _avgP_t.append(torch.diagonal(P_new, dim1=-2, dim2=-1).mean())
+        _Pd = torch.diagonal(P_new, dim1=-2, dim2=-1)
+        _avgP_t.append(_Pd.mean())
+        _maxP_t.append(_Pd.max())
+        _minP_t.append(_Pd.min())
 
     # [opt] 진단 스칼라 1회 변환 (레이어당 ~7 sync → 메트릭당 1 sync로 축소)
     ht_v = torch.stack(_ht_t).tolist()
@@ -4817,6 +4832,8 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
     innovmean_v = torch.stack(_innovmean_t).tolist()
     innovmax_v = torch.stack(_innovmax_t).tolist()
     avgP_v = torch.stack(_avgP_t).tolist()
+    maxP_v = torch.stack(_maxP_t).tolist()
+    minP_v = torch.stack(_minP_t).tolist()
 
     total_innov_mean = float(np.sum(innovmean_v))
     total_innov_max = float(np.max(innovmax_v))
@@ -4860,7 +4877,8 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         'ht_norm': total_ht_norm / layer_count,
         'resid_norm': total_resid_norm / layer_count,
         'avg_P': total_avg_P / layer_count,
-        'max_P': total_avg_P / layer_count,
+        'max_P': float(np.max(maxP_v)),
+        'min_P': float(np.min(minP_v)),
         'delta_y': k_gain_norm,
         'y_pred_norm': torch.norm(z_measured).item(),
         'y_new': 0.0,
@@ -5021,7 +5039,7 @@ class LivePlotter:
         if self.rewards:
             r_min, r_max = min(self.rewards), max(self.rewards)
             if self.reward_ylim is not None:
-                lo = min(self.reward_ylim[0], r_min - abs(r_min) * 0.1 - 1)
+                lo = self.reward_ylim[0]              # 설정 floor 고정 (깊은 추락값에 안 끌려가 상단 가시성↑)
                 hi = max(self.reward_ylim[1], r_max * 1.1)
             else:
                 pad = (r_max - r_min) * 0.1 + 1.0
@@ -5171,7 +5189,8 @@ def train_srrhuif():
     dimS, nA = env.observation_space.shape[0], env.action_space.n
     info = create_network_info(dimS, nA, cfg)
 
-    method_title = f"{'D3QN' if cfg.use_dueling else 'DDQN'} + {cfg.decoupling_mode.upper()} Decoupled"
+    _dec_label = 'Full Vector' if cfg.decoupling_mode == 'fv' else f"{cfg.decoupling_mode.upper()} Decoupled"
+    method_title = f"{'D3QN' if cfg.use_dueling else 'DDQN'} + {_dec_label}"
     
     # ── 실제 작동 prior 선택 ──
     #   state_form='error'이면 prior는 P_Δ⁻ = p_delta_init·I 로 시작하므로
@@ -5348,6 +5367,7 @@ def train_srrhuif():
 
         last_h_p_pred_traj = []  # per-h 예측 P 평균 궤적
         last_h_k_traj, last_h_p_traj, last_h_ht_traj = [], [], []
+        last_h_maxP_traj, last_h_minP_traj = [], []  # per-h 사후 P 대각의 max/min 궤적
         last_h_resid_traj, last_h_innov_decomp, last_h_cos_traj = [], [], []
         last_h_layer_ht, last_h_layer_delta = [], []
         last_h_layer_resid_max = []
@@ -5439,6 +5459,7 @@ def train_srrhuif():
                 if len(batch_hist) == cfg.N_horizon:
                     h_p_pred_traj = []  # 예측 P(process noise 후) per-h
                     h_k_traj, h_p_traj, h_ht_traj = [], [], []
+                    h_maxP_traj, h_minP_traj = [], []  # per-h 사후 P 대각 max/min
                     h_resid_traj, h_resid_in_innov_traj, h_ht_theta_traj = [], [], []
                     h_innov_traj, h_cos_traj = [], []
                     h_layer_ht, h_layer_delta, h_layer_cond, h_layer_ymax = [], [], [], []
@@ -5555,6 +5576,7 @@ def train_srrhuif():
 
                         h_k_traj.append(t_k_gain); h_p_traj.append(dbg['avg_P']); h_ht_traj.append(dbg['ht_norm'])
                         h_p_pred_traj.append(dbg.get('avg_P_pred', dbg['avg_P']))
+                        h_maxP_traj.append(dbg.get('max_P', dbg['avg_P'])); h_minP_traj.append(dbg.get('min_P', dbg['avg_P']))
                         h_resid_traj.append(dbg['resid_norm']); h_resid_in_innov_traj.append(dbg['resid_in_innov'])
                         h_ht_theta_traj.append(dbg['ht_theta_in_innov']); h_innov_traj.append(dbg['innov_norm'])
                         h_layer_ht.append(dbg['per_layer_ht']); h_layer_delta.append(dbg['per_layer_delta'])
@@ -5612,6 +5634,7 @@ def train_srrhuif():
                     
                     last_h_k_traj, last_h_p_traj, last_h_ht_traj = h_k_traj, h_p_traj, h_ht_traj
                     last_h_p_pred_traj = h_p_pred_traj
+                    last_h_maxP_traj, last_h_minP_traj = h_maxP_traj, h_minP_traj
                     last_h_resid_traj, last_h_cos_traj = h_resid_traj, h_cos_traj
                     last_h_innov_decomp = list(zip(h_resid_in_innov_traj, h_ht_theta_traj, h_innov_traj))
                     last_h_layer_ht, last_h_layer_delta = h_layer_ht, h_layer_delta
@@ -5701,6 +5724,17 @@ def train_srrhuif():
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | Q_std: {sp.get('current_q_std', cfg.q_init):.1e} | R_std: {sp.get('current_r_std', cfg.r_init):.1e} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
                   f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
 
+            # ── 호라이즌 진행에 따른 P 변화 (각 fold: 사후 P 대각의 max/min) — 항상 출력 ──
+            if last_h_p_traj:
+                _mx = last_h_maxP_traj if last_h_maxP_traj else last_h_p_traj
+                _mn = last_h_minP_traj if last_h_minP_traj else last_h_p_traj
+                _L = len(last_h_p_traj) - 1
+                _h0 = f"h0 max {_mx[0]:.2e} / min {_mn[0]:.2e}"
+                if _L > 0:
+                    print(f"          └─▶ P horizon: {_h0} | h{_L} max {_mx[_L]:.2e} / min {_mn[_L]:.2e}  (post diag)")
+                else:
+                    print(f"          └─▶ P horizon: {_h0}  (post diag)")
+
             # ── [분석 레이어] 핵심 원인 진단(VERDICT) + verbosity gating ──
             _fb_delta = (FALLBACK_COUNTS['chol_1e5'] - _PREV_FB['chol_1e5']) \
                       + (FALLBACK_COUNTS['tria_qr'] - _PREV_FB['tria_qr'])
@@ -5716,11 +5750,11 @@ def train_srrhuif():
             }
             _verdicts, _culprit, _trend = build_log_diagnosis(_diag_data, cfg)
             if _verdicts:
-                print(f"        ⚑ VERDICT: " + " | ".join(_verdicts[:2]))
-                if _culprit: print(f"        culprit: {_culprit}")
+                file_print(f"        ⚑ VERDICT: " + " | ".join(_verdicts[:2]))
+                if _culprit: file_print(f"        culprit: {_culprit}")
             else:
-                print(f"        ⚑ VERDICT: OK")
-            print(f"        trend: {_trend}")
+                file_print(f"        ⚑ VERDICT: OK")
+            file_print(f"        trend: {_trend}")
             _PREV_FB['chol_1e5'], _PREV_FB['tria_qr'] = FALLBACK_COUNTS['chol_1e5'], FALLBACK_COUNTS['tria_qr']
 
             verbose = (cfg.diag_log_mode == 'always') or (cfg.diag_log_mode == 'auto' and len(_verdicts) > 0)
