@@ -250,7 +250,7 @@ class Config:
     #   'node'  = per-neuron block-diagonal (mean-field, 가장 가벼움)
     #   'layer' = per-layer joint (K-FAC-like, within-layer covariance 보존)
     #   'fv'    = full vector (모든 파라미터를 한 블록으로, 가장 정확하지만 무거움)
-    decoupling_mode: str = 'fv'
+    decoupling_mode: str = 'node'
 
     filter_form: str = 'covariance' # information or covariance
     measurement_mode: str = 'q_target' # q_target or pure_reward
@@ -296,7 +296,7 @@ class Config:
     #   'init'   = 학습 시작시 frozen된 θ_init (RHE/FIR 정신에 더 가까움)
     h0_prior_source: str = 'target'
     
-    shared_layers: List[int] = field(default_factory=lambda: [16,16])   # [] = no hidden shared layers
+    shared_layers: List[int] = field(default_factory=lambda: [12,12])   # [] = no hidden shared layers
     value_layers: List[int] = field(default_factory=lambda: [])
     advantage_layers: List[int] = field(default_factory=lambda: [])
     q_layers: List[int] = field(default_factory=lambda: [])        # [] = sing le linear layer (dimS → nA)
@@ -1039,6 +1039,12 @@ class FilterCache:
         self.unified_thetas = torch.empty(total_forwards, info['total_params'], dtype=DTYPE_FWD, device=device)
         self.layer_fwd_slices = layer_fwd_slices
         self.total_forwards = total_forwards
+
+        # [opt] 측정 업데이트 핫루프에서 매 fold·레이어마다 재생성되던 상수 캐싱
+        #   (node 모드는 레이어 루프라 이 재할당/런치가 누적됨). eye는 2D면 chol fallback에서 broadcast됨.
+        self._bs_cache = cfg.batch_size
+        self.eye_bs = torch.eye(cfg.batch_size, dtype=DTYPE, device=device)
+        self.arange_bs = torch.arange(cfg.batch_size, device=device)
 
         # 연산 최적화를 위해 block_size가 같은 층들끼리 묶기
         self.block_groups = {}
@@ -4998,8 +5004,9 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         fwd_start, fwd_end = f_cache.layer_fwd_slices[L]
         
         Q_L_f32 = Q_all_f32[fwd_start:fwd_end].view(lc['num_blocks'], lc['num_sigma'], info['nA'], -1)
-        Z_sigma_T = Q_L_f32[:, :, batch['a'], torch.arange(batch_sz, device=device)].to(DTYPE)
-        
+        _arange_bs = f_cache.arange_bs if batch_sz == f_cache._bs_cache else torch.arange(batch_sz, device=device)
+        Z_sigma_T = Q_L_f32[:, :, batch['a'], _arange_bs].to(DTYPE)
+
         Wm_col = lc['Wm_col_f32'].to(DTYPE)
         z_hat = (Wm_col * Z_sigma_T).sum(dim=1)  # [num_blocks, batch_sz]
         residual = z_measured.squeeze(-1).unsqueeze(0) - z_hat
@@ -5024,8 +5031,9 @@ def rhukf_step_error(filter_state, ctx, batch, h_idx, sp, cfg, f_cache):
         
         P_zz = P_zz_sigma + R_diag_mat
         P_zz = 0.5 * (P_zz + P_zz.transpose(-1, -2))
-        
-        eye_bs = torch.eye(batch_sz, dtype=DTYPE, device=device).unsqueeze(0).expand(nb, -1, -1)
+
+        # [opt] eye는 캐시된 2D 사용 (chol fallback의 M+λ·eye에서 nb로 broadcast)
+        eye_bs = f_cache.eye_bs if batch_sz == f_cache._bs_cache else torch.eye(batch_sz, dtype=DTYPE, device=device)
         L_zz = safe_cholesky_fallback(P_zz, eye_bs)
         
         tmp = torch.linalg.solve_triangular(L_zz, P_xz.transpose(-1, -2), upper=False)
@@ -5727,7 +5735,9 @@ def train_srrhuif():
     steps_done = 0
     train_start_time = time.time()
     update_times = []
-    
+    param_step_times = []   # [timing] 순수 파라미터 학습(필터 step) 1회당 시간(초). fold 1개 = 1 step
+    _dev_cuda = (str(cfg.device) == 'cuda')  # GPU면 정확 측정 위해 sync 필요
+
     prev_ep_delta = None
     prev_buf_saturated = False
     theta_ep_start = theta.squeeze().clone()
@@ -5907,7 +5917,11 @@ def train_srrhuif():
                     
                     for h in range(loop_count):
                         theta_before_h = theta.squeeze().clone()
-                        
+
+                        # [timing] 순수 파라미터 학습(필터 step) 1-스텝 시간 측정 시작
+                        if _dev_cuda: torch.cuda.synchronize()
+                        _t_step = time.perf_counter()
+
                         # ── 메인 필터 (θ_1) ──
                         if cfg.state_form == 'error':
                             if is_rhukf and is_fv:
@@ -5953,7 +5967,13 @@ def train_srrhuif():
                             else:
                                 theta_2, filter_state_es_2, _, _, _, _ = srrhuif_step_error(
                                     filter_state_es_2, horizon_ctx_2, batch_hist[h], h, sp, cfg, f_cache)
-                        
+
+                        # [timing] 필터 step 종료 — 1-스텝 파라미터 학습 시간 누적
+                        if _dev_cuda: torch.cuda.synchronize()
+                        _step_dt = time.perf_counter() - _t_step
+                        if not do_sigma_spread:  # sigma 프로브 도는 fold는 extra forward로 오염 → 제외
+                            param_step_times.append(_step_dt)
+
                         h_delta = theta.squeeze() - theta_before_h
                         if prev_h_delta is not None:
                             d_norm, p_norm = torch.norm(h_delta), torch.norm(prev_h_delta)
@@ -6115,10 +6135,13 @@ def train_srrhuif():
                 prefix_tag += "[PERis]" if cfg.per_apply_is_weight else "[PER]"
             # covariance form(rhukf)은 q/r이 분산, srrhuif(정보형)은 std로 해석됨 → 라벨 구분
             _qr_label = "Q_var/R_var" if is_rhukf else "Q_std/R_std"
+            # [timing] 1-스텝(필터 fold 1회) 파라미터 학습 시간 — 최근값 평균. /upd = ×N_horizon
+            _learn_ms = (float(np.mean(param_step_times[-200:])) * 1000) if param_step_times else float('nan')
+            _learn_upd_ms = _learn_ms * cfg.N_horizon
 
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | {_qr_label}: {sp.get('current_q_std', cfg.q_init):.1e}/{sp.get('current_r_std', cfg.r_init):.1e} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
-                  f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
+                  f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | Learn: {_learn_ms:.2f}ms/step ({_learn_upd_ms:.2f}ms/upd) | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
 
             # ── 호라이즌 진행에 따른 P 변화 (각 fold: 사후 P 대각의 max/min) — 항상 출력 ──
             if last_h_p_traj:
@@ -6282,12 +6305,18 @@ def train_srrhuif():
                 file_print(f"          └─▶ Ref states:        " + " ".join([f"{name}:ΔQ={ref_q[name]['dq']:+.4f}(a={ref_q[name]['argmax']})" for name in REF_NAMES]))
 
     logger.total_time = time.time() - train_start_time
-    logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0 
+    logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0
+    # [timing] 순수 파라미터 학습 시간: 필터 step 1회(=1 fold) / 업데이트이벤트(=N_horizon folds)
+    param_learn_ms_step = (float(np.mean(param_step_times)) * 1000) if param_step_times else 0.0
+    param_learn_ms_upd = param_learn_ms_step * cfg.N_horizon
+    print(f"[Timing] RHUKF 파라미터 학습: {param_learn_ms_step:.3f} ms/step (필터 fold 1회) | "
+          f"{param_learn_ms_upd:.3f} ms/update (N_horizon={cfg.N_horizon} folds) | "
+          f"측정 step 수={len(param_step_times)} (sigma-probe fold 제외)")
     env.close()
     logger.refresh()
     logger.save_diagnostic_plots()
     logger.save_alpha_activation_plot()  # UT α ↔ 활성화 분석 PNG (FV/UT일 때만 내용 있음)
-    
+
     try:
         plot_cartpole_state_landscape(theta, info, cfg, normalizer, method_title, cfg.param_str)
     except Exception as e: print(f"[경고] 지형도 생성 중 오류 발생: {e}")
@@ -6296,6 +6325,7 @@ def train_srrhuif():
     return {  # [compare] 비교 하네스용 메트릭
         'label': 'RHUKF', 'rewards': list(logger.rewards), 'losses': list(logger.losses),
         'avg_update_ms': logger.avg_step_time, 'total_time': logger.total_time,
+        'param_learn_ms_step': param_learn_ms_step, 'param_learn_ms_upd': param_learn_ms_upd,
         'param_str': cfg.param_str, 'outdir': cfg.outdir,
     }
 
