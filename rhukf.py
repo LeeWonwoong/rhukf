@@ -171,6 +171,21 @@ def safe_cholesky_fallback(M, eye, base_jitter=JITTER):
         FALLBACK_COUNTS['chol_1e5'] += 1
         return torch.linalg.cholesky(M + 1e-5 * eye)
 
+
+def adaptive_r_base(P_zz_sigma, fallback_r, cfg):
+    """[처방 A] 적응형 측정노이즈 base. covariance form 전용.
+    use_adaptive_r=False면 fallback_r(=current_r_std, 분산) 그대로.
+    True면 R_base = max(R_min, λ·Tr(HPH^T)/n_d), Tr(HPH^T)/n_d = mean(diag(P_zz_sigma)).
+      - 초기: H작음 → P_zz_sigma작음 → R작음 → 게인↑ (빠른 학습)
+      - 수렴: H큼 → P_zz_sigma큼 → R큼 → 게인↓ (churn 차단)
+    반환: (R_base, raw). 비적응이면 (fallback_r, None). 적응이면 (clamp후 0-dim, clamp전 0-dim).
+    raw는 R_min 바닥에 걸렸는지 표시용 (raw<R_min이면 floor active)."""
+    if not cfg.use_adaptive_r:
+        return fallback_r, None
+    tr_over_nd = torch.diagonal(P_zz_sigma).mean()   # Tr(P_zz_sigma)/n_d = 측정민감도 신호
+    raw = cfg.adaptive_r_lambda * tr_over_nd          # clamp 전 (R_min 바닥 판정용)
+    return torch.clamp(raw, min=cfg.adaptive_r_min), raw
+
 # =========================================================================
 # 0. Environment Registry
 #   환경별 설정을 한 곳에서 관리. 새 환경 추가 시 여기에 항목만 넣으면 됨.
@@ -250,7 +265,7 @@ class Config:
     #   'node'  = per-neuron block-diagonal (mean-field, 가장 가벼움)
     #   'layer' = per-layer joint (K-FAC-like, within-layer covariance 보존)
     #   'fv'    = full vector (모든 파라미터를 한 블록으로, 가장 정확하지만 무거움)
-    decoupling_mode: str = 'node'
+    decoupling_mode: str = 'fv'
 
     filter_form: str = 'covariance' # information or covariance
     measurement_mode: str = 'q_target' # q_target or pure_reward
@@ -289,7 +304,7 @@ class Config:
     use_residual: bool = False
     use_residual_auto_depth: Optional[int] = 3   # 3 hidden 이상이면 auto-on
 
-    node_layer_other_source: str = 'current' #prior or current
+    node_layer_other_source: str = 'prior' #prior or current
     
     # [FIR 철학] h=0의 prior source
     #   'target' = target net (현재 코드 기존 동작)
@@ -322,17 +337,25 @@ class Config:
     q_init: float = 1e-2
     q_end: float = 1e-2
 
-    r_init: float = 3.0
-    r_end: float = 3.0
+    r_init: float = 2.0
+    r_end: float = 2.0
     huber_c: float = 10
-    
+
+    # [처방 A] 적응형 R (게인 브레이크) — covariance form 전용.
+    #   R_t = max(R_min, λ·Tr(HPH^T)/n_d),  Tr(HPH^T)/n_d = mean(diag(P_zz_sigma)).
+    #   초기 H작음→R작음→게인큼(빠른 학습), 수렴 시 H큼→R큼→게인감쇠(churn 차단).
+    #   FIR(P 매 호라이즌 리셋)과 독립 채널이라 충돌 없음. (cfg.r_init/스케줄은 무시됨)
+    use_adaptive_r: bool = True
+    adaptive_r_lambda: float = 2.0     # λ: Tr(HPH^T)/n_d에 곱하는 신뢰도 스케일
+    adaptive_r_min: float = 1e-3       # R_min: 게인 폭주 방지 하한 (분산 단위)
+
     tikhonov_lambda: float = 1e-6
 
     state_form: str = 'error' # absolute or error
     p_init: float = 0.05
     p_delta_init: float = 0.05
 
-    alpha: float = 0.1
+    alpha: float = 0.3
     beta: float = 2.0
     kappa: float = 0.0
 
@@ -702,6 +725,10 @@ parser.add_argument('--q_end', type=float, default=cfg.q_end,
 parser.add_argument('--r_init', type=float, default=cfg.r_init)
 parser.add_argument('--r_end', type=float, default=cfg.r_end,
                     help="Measurement noise std R 최종값 (eps-decay 종료점, default %(default)s)")
+parser.add_argument('--use_adaptive_r', action='store_true', default=cfg.use_adaptive_r,
+                    help="[처방A] 적응형 R: R=max(R_min, λ·Tr(P_zz_sigma)/n_d) (covariance form 전용)")
+parser.add_argument('--adaptive_r_lambda', type=float, default=cfg.adaptive_r_lambda)
+parser.add_argument('--adaptive_r_min', type=float, default=cfg.adaptive_r_min)
 parser.add_argument('--p_init', type=float, default=cfg.p_init)
 parser.add_argument('--episodes', type=int, default=None,
                     help="총 학습 에피소드 수. 미지정 시 ENV_CONFIGS의 env 기본값 사용.")
@@ -710,6 +737,9 @@ parser.add_argument('--buffer', type=int, default=None,
                     help="Replay buffer 크기. 미지정 시 ENV_CONFIGS의 env 기본값 사용.")
 parser.add_argument('--N_horizon', type=int, default=cfg.N_horizon,
                     help="Receding horizon window size (default %(default)s)")
+parser.add_argument('--decoupling', type=str, default=cfg.decoupling_mode,
+                    choices=['fv', 'node', 'layer'],
+                    help="Decoupling mode: fv / node / layer (default %(default)s)")
 parser.add_argument('--gamma', type=float, default=cfg.gamma,
                     help="Discount factor (default %(default)s)")
 parser.add_argument('--eps_decay_steps', type=int, default=None,
@@ -854,6 +884,9 @@ cfg.q_init = args.q_init
 cfg.q_end = args.q_end
 cfg.r_init = args.r_init
 cfg.r_end = args.r_end
+cfg.use_adaptive_r = args.use_adaptive_r
+cfg.adaptive_r_lambda = args.adaptive_r_lambda
+cfg.adaptive_r_min = args.adaptive_r_min
 cfg.p_init = args.p_init
 if args.episodes is not None:
     cfg.max_episodes = args.episodes
@@ -881,6 +914,7 @@ import sys as _sys
 cfg._filter_form_explicit = any(a.startswith('--filter_form') for a in _sys.argv)
 cfg.filter_form = args.filter_form
 cfg.state_form = args.state_form
+cfg.decoupling_mode = args.decoupling
 cfg.measurement_mode = args.measurement_mode
 cfg.use_per = args.use_per
 cfg.per_alpha = args.per_alpha
@@ -3250,7 +3284,9 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
     
     current_r_std = sp.get('current_r_std', cfg.r_init)
     # [covariance form] r_init = measurement noise VARIANCE 직접 (제곱 안 함)
-    R_diag_eff = current_r_std * adapt_factor  # [batch_sz], per-sample variance
+    # [처방A] 적응형 R이면 base = max(R_min, λ·Tr(P_zz_sigma)/n_d), 아니면 current_r_std
+    R_base, _r_raw = adaptive_r_base(P_zz_sigma, current_r_std, cfg)
+    R_diag_eff = R_base * adapt_factor  # [batch_sz], per-sample variance
 
     P_zz = P_zz_sigma + torch.diag(R_diag_eff)
     P_zz = 0.5 * (P_zz + P_zz.t())  # symmetrize
@@ -3319,6 +3355,8 @@ def rhukf_step_fv(theta_current_in, theta_target, filter_P_cov, batch, sp,
         'ht_theta_in_innov': 0.0,
         'nis': nis_val,
         'lin_bias': lin_bias_val,
+        'r_eff': float(R_base),  # [처방A] 이 스텝 실제 적용된 R base (적응형이면 동적값)
+        'r_tr_raw': (float(_r_raw) if _r_raw is not None else float(R_base)),  # clamp 전 λ·Tr/n_d
         'avg_P': avg_P,
         'avg_P_pred': avg_P_pred,  # process noise 주입 후(예측) — 관측 반영 전
         'max_P': max_P,
@@ -4110,10 +4148,12 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         adapt_factor = torch.clamp(res_abs / cfg.huber_c, min=1.0)
     current_r_std = sp.get('current_r_std', cfg.r_init)
     # [covariance form] r_init = measurement noise VARIANCE 직접 (제곱 안 함)
-    R_diag_eff = current_r_std * adapt_factor
+    # [처방A] 적응형 R이면 base = max(R_min, λ·Tr(P_zz_sigma)/n_d), 아니면 current_r_std
+    R_base, _r_raw = adaptive_r_base(P_zz_sigma, current_r_std, cfg)
+    R_diag_eff = R_base * adapt_factor
     P_zz = P_zz_sigma + torch.diag(R_diag_eff)
     P_zz = 0.5 * (P_zz + P_zz.t())
-    
+
     # ── Kalman gain ─────────────────────────────────────────────────
     eye_batch = torch.eye(batch_sz, dtype=DTYPE, device=device)
     L_zz = safe_cholesky_fallback(P_zz, eye_batch)
@@ -4161,6 +4201,8 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
         'ht_theta_in_innov': 0.0,  # KF form: 항상 0 (정보형의 H^T·θ_pred 항 없음)
         'nis': nis_val,
         'lin_bias': lin_bias_val,
+        'r_eff': float(R_base),  # [처방A] 이 스텝 실제 적용된 R base (적응형이면 동적값)
+        'r_tr_raw': (float(_r_raw) if _r_raw is not None else float(R_base)),  # clamp 전 λ·Tr/n_d
         'avg_P': avg_P,
         'avg_P_pred': avg_P_pred,  # process noise 주입 후(예측) — 관측 반영 전
         'max_P': max_P,
@@ -5603,6 +5645,10 @@ def train_srrhuif():
     print(f"  Settings: {eff_prior_name}={eff_prior} (effective prior), Tikhonov={cfg.tikhonov_lambda}, Huber_c={cfg.huber_c}")
     _qr_interp = "variance (분산 그대로)" if cfg.filter_form == 'covariance' else "std (루트값, 내부에서 제곱)"
     print(f"  Q/R interp: q_init={cfg.q_init:g}, r_init={cfg.r_init:g} → {_qr_interp}")
+    if cfg.use_adaptive_r:
+        _ar_active = (cfg.decoupling_mode == 'fv' and cfg.filter_form == 'covariance')
+        print(f"  [처방A] Adaptive R: ON → R=max({cfg.adaptive_r_min:g}, {cfg.adaptive_r_lambda:g}·Tr(HPHᵀ)/n_d) "
+              f"(r_init={cfg.r_init:g} 무시)" + ("" if _ar_active else "  ⚠ 현재 FV+covariance 아님 → 미적용(무시됨)"))
     print(f"  N-step: use={cfg.use_n_step}, size={cfg.n_step_size} "
           f"(target γ = {cfg.gamma ** cfg.n_step_size if cfg.use_n_step else cfg.gamma:.4f})")
     if cfg.use_per:
@@ -5625,7 +5671,10 @@ def train_srrhuif():
     # [FV 분기] 모드별 캐시 생성
     # ──────────────────────────────────────────────────────────────────
     is_fv = (cfg.decoupling_mode == 'fv')
-    is_rhukf = is_fv and (cfg.filter_form == 'covariance')
+    # [fix] covariance form이면 FV/node 무관하게 RHUKF 경로로 dispatch.
+    #   (이전: `is_fv and ...` 때문에 node+covariance가 elif is_rhukf에 도달 못 하고
+    #    srrhuif(정보형)로 잘못 빠졌음 — node는 filter_form='covariance'가 무시됐던 버그.)
+    is_rhukf = (cfg.filter_form == 'covariance')
     if is_fv:
         f_cache = FilterCacheFV(info, cfg, cfg.device)
     else:
@@ -5766,6 +5815,8 @@ def train_srrhuif():
         ep_i_mean, ep_i_max = [], []
         ep_avg_P = []  # [v6] dbg['avg_P'] 모아서 LivePlotter에 동적 P 추적
         ep_avg_P_pred = []  # process noise 주입 후(예측) P 평균 — 관측 반영 전
+        ep_r_eff = []  # [처방A] 적응형 R base 추적
+        ep_r_tr_raw = []  # [처방A] clamp 전 λ·Tr/n_d 신호
 
         last_h_p_pred_traj = []  # per-h 예측 P 평균 궤적
         last_h_k_traj, last_h_p_traj, last_h_ht_traj = [], [], []
@@ -5985,6 +6036,8 @@ def train_srrhuif():
                         ep_i_mean.append(dbg['innov_mean']); ep_i_max.append(dbg['innov_max'])
                         ep_avg_P.append(dbg['avg_P'])  # [v6] dynamic P tracking
                         ep_avg_P_pred.append(dbg.get('avg_P_pred', dbg['avg_P']))  # 예측 P (없으면 사후로 폴백)
+                        if 'r_eff' in dbg: ep_r_eff.append(dbg['r_eff'])  # [처방A] 적응형 R 추적
+                        if 'r_tr_raw' in dbg: ep_r_tr_raw.append(dbg['r_tr_raw'])  # clamp 전 신호
 
                         h_k_traj.append(t_k_gain); h_p_traj.append(dbg['avg_P']); h_ht_traj.append(dbg['ht_norm'])
                         h_p_pred_traj.append(dbg.get('avg_P_pred', dbg['avg_P']))
@@ -6138,9 +6191,14 @@ def train_srrhuif():
             # [timing] 1-스텝(필터 fold 1회) 파라미터 학습 시간 — 최근값 평균. /upd = ×N_horizon
             _learn_ms = (float(np.mean(param_step_times[-200:])) * 1000) if param_step_times else float('nan')
             _learn_upd_ms = _learn_ms * cfg.N_horizon
+            # [처방A] 적응형 R이면 실제 적용된 R 평균을 표시(설정 r_init 대신)
+            if cfg.use_adaptive_r and ep_r_eff:
+                _r_disp = f"{np.mean(ep_r_eff):.1e}*"  # *=adaptive
+            else:
+                _r_disp = f"{sp.get('current_r_std', cfg.r_init):.1e}"
 
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
-                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | {_qr_label}: {sp.get('current_q_std', cfg.q_init):.1e}/{sp.get('current_r_std', cfg.r_init):.1e} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
+                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | {_qr_label}: {sp.get('current_q_std', cfg.q_init):.1e}/{_r_disp} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
                   f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | Learn: {_learn_ms:.2f}ms/step ({_learn_upd_ms:.2f}ms/upd) | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
 
             # ── 호라이즌 진행에 따른 P 변화 (각 fold: 사후 P 대각의 max/min) — 항상 출력 ──
@@ -6153,6 +6211,12 @@ def train_srrhuif():
                     print(f"          └─▶ P horizon: {_h0} | h{_L} max {_mx[_L]:.2e} / min {_mn[_L]:.2e}  (post diag)")
                 else:
                     print(f"          └─▶ P horizon: {_h0}  (post diag)")
+
+            # ── [처방A] 적응형 R 실제 적용값 (켜졌고 측정값 있을 때만) ──
+            if cfg.use_adaptive_r and ep_r_eff:
+                _r_mean = float(np.mean(ep_r_eff))
+                _r_lo, _r_hi = float(np.min(ep_r_eff)), float(np.max(ep_r_eff))
+                print(f"          └─▶ R(adaptive): mean={_r_mean:.2e}  range[{_r_lo:.2e}, {_r_hi:.2e}]  (r_init={cfg.r_init:g} 무시됨)")
 
             # ── [UT α-Analysis] alpha의 spread/중심가중치 ↔ 활성화 결합 종합 — txt 기록 + 시계열 저장 ──
             if cfg.diag_alpha_analysis:
