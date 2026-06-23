@@ -157,18 +157,11 @@ DTYPE_FWD = torch.float32
 JITTER = 1e-6
 JITTER_TRIA = 1e-6
 
-# ── Fallback 발동 횟수 카운터 (수치적 안정성 진단용) ──
-#   chol_1e5: Cholesky(1e-6 jitter) 실패 → 1e-5 jitter 재시도 횟수
-#   tria_qr : tria_operation_batch에서 Cholesky 실패 → QR 폴백 횟수
-FALLBACK_COUNTS = {'chol_1e5': 0, 'tria_qr': 0}
-
 def safe_cholesky_fallback(M, eye, base_jitter=JITTER):
-    """Cholesky를 base_jitter로 먼저 시도하고, 실패 시 1e-5 jitter로 재시도하며
-    그 횟수를 FALLBACK_COUNTS['chol_1e5']에 누적한다."""
+    """Cholesky를 base_jitter로 먼저 시도하고, 실패 시 1e-5 jitter로 재시도한다."""
     try:
         return torch.linalg.cholesky(M + base_jitter * eye)
     except Exception:
-        FALLBACK_COUNTS['chol_1e5'] += 1
         return torch.linalg.cholesky(M + 1e-5 * eye)
 
 
@@ -197,11 +190,12 @@ ENV_CONFIGS: Dict[str, Dict] = {
     "CartPole-v1": {
         "obs_scale": [2.4, 3.0, 0.21, 2.0],
         "max_steps": 500,
-        "max_episodes": 120,
+        "max_episodes": 150,
         "eps_decay_steps": 2000,
-        "buffer_size": 200000,
+        "buffer_size": 50000,
         "results_dir": "results_cartpole",
-        "reward_threshold": 195,       # solved 기준 (avg reward)
+        "reward_threshold": 195,       # 그래프 기준선용 (구 v0 임계, plot axhline)
+        "solved_threshold": 475,       # 공식 solved = 최근 100ep 평균 ≥ 475 (만점 500) → early-stop 기준
         "reward_ylim": [0, 520],       # 보상 그래프 y축 (CartPole: 0~500)
         "action_labels": ["Left", "Right"],
     },
@@ -213,7 +207,8 @@ ENV_CONFIGS: Dict[str, Dict] = {
         "eps_decay_steps": 15000,
         "buffer_size": 300000,
         "results_dir": "results_lunarlander",
-        "reward_threshold": 200,       # solved 기준 (avg reward)
+        "reward_threshold": 200,       # 그래프 기준선용 (plot axhline)
+        "solved_threshold": 230,       # 공식 solved=200, 변동성 고려해 +30 여유(안정 확보) → early-stop 기준
         "reward_ylim": [-200, 320],    # 보상 그래프 y축 (LunarLander: floor -200로 올려 200+ 영역 강조, 깊은 추락은 클리핑)
         "action_labels": ["NOP", "Left engine", "Main engine", "Right engine"],
     },
@@ -288,7 +283,7 @@ class Config:
     #   'prev_est'     = 직전 호라이즌 종료 시점 active θ (horizon 직전 theta_active)
     #   'theta_target' = θ_target (보수적, target net 안정성 활용)
     #   'spas'         = sigma-point ensemble mean argmax (FV 전용)
-    h0_online_moving_init: str = 'prev_est'
+    h0_online_moving_init: str = 'spas'
     
     use_twin: bool = False  # ★ Overestimation 구조적 해결: 페널티 c 없이 min으로 안전 (TD3 식)
 
@@ -311,14 +306,14 @@ class Config:
     #   'init'   = 학습 시작시 frozen된 θ_init (RHE/FIR 정신에 더 가까움)
     h0_prior_source: str = 'target'
     
-    shared_layers: List[int] = field(default_factory=lambda: [12,12])   # [] = no hidden shared layers
+    shared_layers: List[int] = field(default_factory=lambda: [24,24])   # [] = no hidden shared layers
     value_layers: List[int] = field(default_factory=lambda: [])
     advantage_layers: List[int] = field(default_factory=lambda: [])
     q_layers: List[int] = field(default_factory=lambda: [])        # [] = sing le linear layer (dimS → nA)
 
     use_dueling: bool = False # False로 두어 순수 DDQN 아키텍처 사용 (Layer 모드 최적화)
 
-    gamma: float = 0.9
+    gamma: float = 0.94
     scale_factor: float = 1.0
     
     tau_srrhuif: float = 0.02
@@ -331,8 +326,8 @@ class Config:
     init_scheme: str = 'he' #xavier
 
     buffer_size: int = 50000
-    batch_size: int = 64
-    N_horizon: int = 4
+    batch_size: int = 128
+    N_horizon: int = 6
     
     q_init: float = 1e-2
     q_end: float = 1e-2
@@ -346,16 +341,16 @@ class Config:
     #   초기 H작음→R작음→게인큼(빠른 학습), 수렴 시 H큼→R큼→게인감쇠(churn 차단).
     #   FIR(P 매 호라이즌 리셋)과 독립 채널이라 충돌 없음. (cfg.r_init/스케줄은 무시됨)
     use_adaptive_r: bool = True
-    adaptive_r_lambda: float = 2.0     # λ: Tr(HPH^T)/n_d에 곱하는 신뢰도 스케일
-    adaptive_r_min: float = 1e-3       # R_min: 게인 폭주 방지 하한 (분산 단위)
+    adaptive_r_lambda: float = 2     # λ: Tr(HPH^T)/n_d에 곱하는 신뢰도 스케일
+    adaptive_r_min: float = 0.1      # R_min: 게인 폭주 방지 하한 (분산 단위)
 
     tikhonov_lambda: float = 1e-6
 
     state_form: str = 'error' # absolute or error
-    p_init: float = 0.05
-    p_delta_init: float = 0.05
-
-    alpha: float = 0.3
+    p_init: float = 0.2
+    p_delta_init: float = 0.1
+ 
+    alpha: float = 0.9
     beta: float = 2.0
     kappa: float = 0.0
 
@@ -378,6 +373,34 @@ class Config:
     per_beta_end: float = 1.0       # β annealing 끝 (완전 불편보정)
 
     warmup_step : int = 0
+
+    # ── [burst robustness] 특정 에피소드 구간에 큰 측정 오차(burst)를 주입해
+    #    필터의 outlier 강건성을 테스트. measurement(=reward) r에 ±burst_value 가산(부호 정책).
+    #   burst_store_in_buffer=True (O): 오염된 r을 버퍼에 저장 → 지속적 outlier (반복 샘플링됨)
+    #   burst_store_in_buffer=False(X): 버퍼는 클린 유지, 필터 업데이트의 measurement만 일시 오염
+    #     (한 batch에 대해서만, buffer.R은 건드리지 않음 → transient glitch)
+    use_burst: bool = True
+    burst_ep_start: int = 40            # 버스트 주입 시작 에피소드 (이상)
+    burst_ep_end: int = 70             # 버스트 주입 종료 에피소드 (이하)
+    burst_prob: float = 0.1             # 주입 확률 (O: env step당 / X: batch 샘플당)
+    burst_value: float = 10.0           # 가산 오차 크기 (scale_factor 적용 전 reward 단위)
+    burst_sign: str = 'random'          # 'random'(±) | 'pos'(+only) | 'neg'(-only)
+    burst_store_in_buffer: bool = False  # True=O(버퍼 영구 오염) / False=X(필터 일시 오염)
+    _burst_count: int = 0               # 런타임 주입 횟수 카운터 (내부용)
+
+    # ── [checkpoint & early stop] ──
+    #   best checkpoint: 환경 무관 항상 저장 ("지금까지 최고 이동평균이면 저장"). RL 보편 표준.
+    #     단일 ep 운빨 spike를 피하려고 best_metric_window 이동평균으로 판정.
+    #   early stop: 환경별 공식 'solved' 기준(최근 100ep 평균 ≥ threshold) 충족 시 중단.
+    #     best checkpoint와 독립 — early stop을 꺼도 best는 계속 저장됨.
+    save_best_ckpt: bool = True
+    best_metric_window: int = 20        # best 판정 이동평균 창
+    use_early_stop: bool = True
+    early_stop_window: int = 100        # solved 판정 이동평균 창 (RL 공식 기준=100ep)
+    early_stop_threshold: Optional[float] = None  # None이면 ENV_CONFIGS[env]['solved_threshold'] 사용
+    early_stop_min_episodes: int = 80  # 최소 이 에피소드 이후부터만 중단 허용 (창이 다 차야 정당)
+    _in_compare: bool = False           # compare 모드면 early stop 비활성(공정 비교). best는 유지.
+    _solved_threshold: Optional[float] = None  # 런타임: 실제 적용된 threshold (내부용)
 
     train_mode: str = 'filter' # 'filter'(RHUKF) | 'adam'(DDQN baseline) | 'compare'(둘 다 실행→비교 결과 내보냄)
     use_adam_warmup: bool = False
@@ -410,7 +433,6 @@ class Config:
     video_interval: int = 100           # 매 N 에피소드마다 1개 녹화 (ep % N == 0)
     video_dir: Optional[str] = None    # None이면 {outdir}/videos
     video_async: bool = True           # True면 데몬 스레드에서 녹화(학습 비차단)
-
 
     use_full_eigvalsh: bool = True
     diag_ref_states: bool = True
@@ -621,6 +643,20 @@ class Config:
                 f"target_update_period={self.target_update_period} must be > 0 for hard update."
             )
         
+        # [burst robustness] 검증
+        valid_bsign = {'random', 'pos', 'neg'}
+        if self.burst_sign not in valid_bsign:
+            raise ValueError(
+                f"burst_sign='{self.burst_sign}' invalid. Must be one of {valid_bsign}."
+            )
+        if self.use_burst:
+            if self.burst_ep_start > self.burst_ep_end:
+                raise ValueError(
+                    f"burst_ep_start({self.burst_ep_start}) > burst_ep_end({self.burst_ep_end})."
+                )
+            if not (0.0 <= self.burst_prob <= 1.0):
+                raise ValueError(f"burst_prob={self.burst_prob} must be in [0, 1].")
+
         self.r_inv_sqrt = 1.0 / self.r_init
         self.r_inv = 1.0 / (self.r_init ** 2)
         duel_str = "D3QN" if self.use_dueling else "DDQN"
@@ -653,14 +689,27 @@ class Config:
         #   prior는 state_form에 따라 하나만: error→pd, absolute→p
         prior_tag = f"pd{self.p_delta_init:g}" if self.state_form == 'error' else f"p{self.p_init:g}"
         net_tag = f"net[{','.join(str(x) for x in self.shared_layers)}]"
+        # [burst] burst 실험 결과가 클린 run과 섞이지 않도록 태그 (store: buf=O / tr=X)
+        if self.use_burst:
+            _bstore = "buf" if self.burst_store_in_buffer else "tr"
+            burst_tag = (f"_burst{self.burst_value:g}p{self.burst_prob:g}"
+                         f"e{self.burst_ep_start}-{self.burst_ep_end}{_bstore}")
+        else:
+            burst_tag = ""
+        # [adaptive R] 적응형 R이면 고정 r_init은 무시되므로 파일명도 적응형 설정(λ/min)으로 표기.
+        #   rAd{λ}-{min} = adaptive_r_lambda / adaptive_r_min. 비적응이면 기존 r{r_init}.
+        if self.use_adaptive_r:
+            r_tag = f"rAd{self.adaptive_r_lambda:g}-{self.adaptive_r_min:g}"
+        else:
+            r_tag = f"r{self.r_init:g}"
         if self.train_mode == 'adam':
             self.param_str = (
-                f"ADAM_lr{self.adam_lr:g}_b{self.batch_size}_{net_tag}_s{self.network_seed}"
+                f"ADAM_lr{self.adam_lr:g}_b{self.batch_size}_{net_tag}_s{self.network_seed}{burst_tag}"
             )
         else:
             self.param_str = (
-                f"a{self.alpha}_r{self.r_init}_b{self.batch_size}_h{self.N_horizon}_"
-                f"q{self.q_init:g}_{net_tag}_{prior_tag}_s{self.network_seed}"
+                f"a{self.alpha}_{r_tag}_b{self.batch_size}_h{self.N_horizon}_"
+                f"q{self.q_init:g}_{net_tag}_{prior_tag}_s{self.network_seed}{burst_tag}"
             )
         # ── [env config] 환경별 설정 적용 ──
         env_cfg = ENV_CONFIGS.get(self.env_name, {})
@@ -675,10 +724,62 @@ class Config:
         if ('buffer_size' in env_cfg) and (not self._buffer_size_explicit):
             self.buffer_size = env_cfg['buffer_size']
         results_dir = self.results_dir or env_cfg.get('results_dir', 'results')
+        # [early stop] 적용 threshold: 명시값 우선, 없으면 env 공식 solved 기준.
+        self._solved_threshold = (self.early_stop_threshold
+                                  if self.early_stop_threshold is not None
+                                  else env_cfg.get('solved_threshold'))
         self.outdir = f"./{results_dir}/{self.param_str}"
         # 폴더 비우기(overwrite)는 여기서 하지 않는다 — __post_init__은 import/argparse/compare에서
         #   여러 번 불려서 삭제 타이밍이 꼬임. 실제 run 시작 시 prepare_outdir()가 1회 정리한다.
         os.makedirs(self.outdir, exist_ok=True)
+
+
+def burst_delta_scalar(cfg: 'Config') -> float:
+    """단일 transition용 ±burst_value 오차 (부호 정책 적용). O(버퍼 저장) 경로용."""
+    if cfg.burst_sign == 'pos':
+        sign = 1.0
+    elif cfg.burst_sign == 'neg':
+        sign = -1.0
+    else:
+        sign = 1.0 if np.random.rand() < 0.5 else -1.0
+    return sign * cfg.burst_value
+
+
+def burst_deltas_tensor(cfg: 'Config', n: int, device) -> "torch.Tensor":
+    """배치용 ±burst_value 오차 텐서 [n] (부호 정책 적용). X(일시 오염) 경로용."""
+    if cfg.burst_sign == 'pos':
+        signs = torch.ones(n, dtype=DTYPE, device=device)
+    elif cfg.burst_sign == 'neg':
+        signs = -torch.ones(n, dtype=DTYPE, device=device)
+    else:
+        rand = torch.rand(n, device=device)
+        signs = torch.where(rand < 0.5,
+                            torch.ones(n, dtype=DTYPE, device=device),
+                            -torch.ones(n, dtype=DTYPE, device=device))
+    return signs * cfg.burst_value
+
+
+def save_checkpoint(path, theta, theta_target, info, normalizer, cfg, ep, metric,
+                    kind='best', theta_2=None):
+    """체크포인트 저장. info는 직렬화 안전한 스칼라/리스트 키만 추림(act_fn 등 함수 제외).
+    payload로 θ / θ_target / (twin) θ_2 / 입력 정규화 scale / 메타를 담는다."""
+    safe_keys = ('dimS', 'nA', 'total_params', 'use_dueling', 'act_name',
+                 'shared_end_idx', 'value_end_idx')
+    info_meta = {k: info[k] for k in safe_keys if k in info}
+    payload = {
+        'theta': theta.detach().cpu().clone(),
+        'theta_target': (theta_target.detach().cpu().clone() if theta_target is not None else None),
+        'theta_2': (theta_2.detach().cpu().clone() if theta_2 is not None else None),
+        'info_meta': info_meta,
+        'normalizer_scale': (normalizer.scale.detach().cpu().clone() if normalizer is not None else None),
+        'env_name': cfg.env_name,
+        'param_str': cfg.param_str,
+        'episode': int(ep),
+        'metric': float(metric),
+        'kind': kind,
+    }
+    torch.save(payload, path)
+
 
 cfg = Config()
 
@@ -857,6 +958,39 @@ parser.add_argument('--adam_update_interval', type=int, default=cfg.adam_update_
                     help="Adam baseline env 스텝당 업데이트 주기 (default %(default)s)")
 parser.add_argument('--no_adam_fp32', dest='adam_force_fp32', action='store_false', default=cfg.adam_force_fp32,
                     help="Adam baseline에서 TF32 강제 비활성 해제 (기본은 FP32 강제)")
+# ── [burst robustness] reward(measurement) burst 오차 주입 ──
+parser.add_argument('--use_burst', dest='use_burst', action='store_true', default=cfg.use_burst,
+                    help="[robustness] 특정 에피소드 구간에 reward(measurement) burst 오차 주입")
+parser.add_argument('--no_burst', dest='use_burst', action='store_false',
+                    help="burst 비활성")
+parser.add_argument('--burst_ep_start', type=int, default=cfg.burst_ep_start,
+                    help="burst 주입 시작 에피소드 (이상, default %(default)s)")
+parser.add_argument('--burst_ep_end', type=int, default=cfg.burst_ep_end,
+                    help="burst 주입 종료 에피소드 (이하, default %(default)s)")
+parser.add_argument('--burst_prob', type=float, default=cfg.burst_prob,
+                    help="burst 주입 확률 (default %(default)s)")
+parser.add_argument('--burst_value', type=float, default=cfg.burst_value,
+                    help="burst 가산 오차 크기, reward 단위 (default %(default)s)")
+parser.add_argument('--burst_sign', type=str, default=cfg.burst_sign, choices=['random', 'pos', 'neg'],
+                    help="burst 부호 정책: random(±) / pos(+) / neg(-) (default %(default)s)")
+parser.add_argument('--burst_store_in_buffer', dest='burst_store_in_buffer', action='store_true',
+                    default=cfg.burst_store_in_buffer,
+                    help="O: 오염된 r을 버퍼에 영구 저장 (지속적 outlier, 반복 샘플링)")
+parser.add_argument('--burst_transient', dest='burst_store_in_buffer', action='store_false',
+                    help="X: 버퍼는 클린, 필터 업데이트의 measurement만 일시 오염 (transient glitch)")
+# ── [checkpoint & early stop] ──
+parser.add_argument('--no_best_ckpt', dest='save_best_ckpt', action='store_false', default=cfg.save_best_ckpt,
+                    help="best checkpoint 저장 비활성 (기본은 항상 저장)")
+parser.add_argument('--best_metric_window', type=int, default=cfg.best_metric_window,
+                    help="best 판정 이동평균 창 (default %(default)s)")
+parser.add_argument('--no_early_stop', dest='use_early_stop', action='store_false', default=cfg.use_early_stop,
+                    help="solved 도달 시 조기 중단 비활성 (best ckpt는 유지)")
+parser.add_argument('--early_stop_window', type=int, default=cfg.early_stop_window,
+                    help="solved 판정 이동평균 창 (RL 공식=100, default %(default)s)")
+parser.add_argument('--early_stop_threshold', type=float, default=None,
+                    help="solved 임계. 미지정 시 ENV_CONFIGS[env]의 공식 solved 기준 사용.")
+parser.add_argument('--early_stop_min_episodes', type=int, default=cfg.early_stop_min_episodes,
+                    help="이 에피소드 이후부터만 중단 허용 (default %(default)s)")
 args, _ = parser.parse_known_args()
 
 cfg.env_name = args.env
@@ -946,6 +1080,23 @@ cfg.adam_update_interval = args.adam_update_interval
 cfg.adam_force_fp32 = args.adam_force_fp32
 cfg.adam_lr_end = args.adam_lr_end
 cfg.adam_lr_anneal = args.adam_lr_anneal
+
+# [burst robustness]
+cfg.use_burst = args.use_burst
+cfg.burst_ep_start = args.burst_ep_start
+cfg.burst_ep_end = args.burst_ep_end
+cfg.burst_prob = args.burst_prob
+cfg.burst_value = args.burst_value
+cfg.burst_sign = args.burst_sign
+cfg.burst_store_in_buffer = args.burst_store_in_buffer
+
+# [checkpoint & early stop]
+cfg.save_best_ckpt = args.save_best_ckpt
+cfg.best_metric_window = args.best_metric_window
+cfg.use_early_stop = args.use_early_stop
+cfg.early_stop_window = args.early_stop_window
+cfg.early_stop_threshold = args.early_stop_threshold  # None이면 __post_init__에서 env 기본값
+cfg.early_stop_min_episodes = args.early_stop_min_episodes
 
 if args.shared_layers is not None:
     cfg.shared_layers = args.shared_layers
@@ -1500,7 +1651,6 @@ def tria_operation_batch(A):
         except Exception:
             # 만약 특이 행렬(Singular) 문제로 Cholesky가 실패하면,
             # 당황하지 않고 아래의 안전한 QR 로직으로 폴백(Fallback)합니다.
-            FALLBACK_COUNTS['tria_qr'] += 1
             pass
 
     # 🛡️ [SAFE MODE] Node Decoupled 이거나, LD에서 Cholesky가 실패했을 때의 QR 로직
@@ -2157,9 +2307,6 @@ def analyze_ut_alpha(cfg, n_x, spread_h=None, amp_h=None, spos_h=None,
 # 5b. Log Analysis Layer — "이 시점의 핵심 원인" 자동 진단
 #   이미 계산된 last_h_* / 에피소드 스칼라를 룰로 해석. 추가 연산 거의 없음.
 # =========================================================================
-_PREV_FB = {'chol_1e5': 0, 'tria_qr': 0}  # FB 누적 카운터의 직전 스냅샷 (interval delta용)
-
-
 def _traj_trend(traj):
     """궤적 → (방향기호, 배율). 앞 1/3 평균 대비 뒤 1/3 평균. 증가=위험, 감소=수축(건강)."""
     if traj is None or len(traj) < 2:
@@ -2228,17 +2375,15 @@ def build_log_diagnosis(data, cfg):
         if gain_h[-1] > 1.0 and sym in ('↑', '↑↑'):
             verdicts.append((gain_h[-1] - 1.0, f"GAIN_RUNAWAY g {gain_h[0]:.2f}→{gain_h[-1]:.2f}"))
 
-    # 3) COV_ILLCOND: cond 큼 / P_avg 급증 / FB 발동
+    # 3) COV_ILLCOND: cond 큼 / P_avg 급증
     cond_h = data.get('cond_layer_h') or []
     cond_max = max((max(d.values()) for d in cond_h), default=0.0)
     p_sym, _ = _traj_trend(data.get('p_traj') or [])
-    fb_delta = data.get('fb_delta', 0)
-    if cond_max > cfg.cond_warn or p_sym == '↑↑' or fb_delta > 0:
+    if cond_max > cfg.cond_warn or p_sym == '↑↑':
         sev = 0.0
         if cond_max > cfg.cond_warn: sev += math.log10(cond_max / cfg.cond_warn)
-        if fb_delta > 0: sev += 0.5 * fb_delta
         if p_sym == '↑↑': sev += 0.5
-        verdicts.append((sev, f"COV_ILLCOND cond {cond_max:.0e} FB+{fb_delta} P {p_sym}"))
+        verdicts.append((sev, f"COV_ILLCOND cond {cond_max:.0e} P {p_sym}"))
 
     # 4) PLASTICITY_LOSS: dead 비율 / eff_rank 저하
     dead = data.get('dead_ratio')
@@ -5799,6 +5944,22 @@ def train_srrhuif():
 
     s, _ = env.reset(seed=env_seed)
 
+    # [burst robustness] 카운터 리셋 + 설정 배너
+    cfg._burst_count = 0
+    if cfg.use_burst:
+        _bmode = "버퍼저장(O, 지속)" if cfg.burst_store_in_buffer else "일시오염(X, transient)"
+        print(f"[burst] ON | ep[{cfg.burst_ep_start}-{cfg.burst_ep_end}] "
+              f"prob={cfg.burst_prob:g} value=±{cfg.burst_value:g}({cfg.burst_sign}) | {_bmode}")
+
+    # [checkpoint & early stop] best는 환경 무관 항상, early stop은 env solved 기준(compare면 비활성)
+    best_metric, best_ep, early_stopped = -float('inf'), -1, False
+    _solved_thr = cfg._solved_threshold
+    _es_active = (cfg.use_early_stop and not cfg._in_compare and _solved_thr is not None)
+    _es_msg = (f"avg{cfg.early_stop_window}≥{_solved_thr:g}(min_ep={cfg.early_stop_min_episodes})"
+               if _es_active else ("off(compare)" if cfg._in_compare else "off"))
+    print(f"[ckpt] best: {'on(avg%d)' % cfg.best_metric_window if cfg.save_best_ckpt else 'off'} "
+          f"| early-stop: {_es_msg}")
+
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=env_seed + ep)
         buffer.set_current_episode(ep)
@@ -5866,13 +6027,30 @@ def train_srrhuif():
             else:
                 a = int(q_vals.argmax().item())
             ns, r, done, trunc, _ = env.step(a)
-            buffer.push(s, a, r / cfg.scale_factor, ns, done)
+            # [burst-O] 버퍼 저장 경로: 오염된 r을 버퍼에 영구 저장 (지속적 outlier)
+            r_store = r
+            if (cfg.use_burst and cfg.burst_store_in_buffer
+                    and cfg.burst_ep_start <= ep <= cfg.burst_ep_end
+                    and np.random.rand() < cfg.burst_prob):
+                r_store = r + burst_delta_scalar(cfg)
+                cfg._burst_count += 1
+            buffer.push(s, a, r_store / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
             if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
                 update_start = time.perf_counter()
                 batch = buffer.sample_batch(cfg.batch_size)
-                
+                # [burst-X] 일시 오염 경로: 버퍼(buffer.R)는 클린, 이 batch의 measurement만 오염
+                if (cfg.use_burst and not cfg.burst_store_in_buffer
+                        and cfg.burst_ep_start <= ep <= cfg.burst_ep_end):
+                    _bmask = torch.rand(cfg.batch_size, device=batch['r'].device) < cfg.burst_prob
+                    _nb = int(_bmask.sum().item())
+                    if _nb > 0:
+                        _bd = burst_deltas_tensor(cfg, _nb, batch['r'].device) / cfg.scale_factor
+                        batch['r'] = batch['r'].clone()
+                        batch['r'][_bmask] += _bd.to(batch['r'].dtype)
+                        cfg._burst_count += _nb
+
                 batch_hist.append(batch)
 
                 # ─────────────────────────────────────────────────────────
@@ -6131,6 +6309,28 @@ def train_srrhuif():
         avg_P_pred_ep = np.mean(ep_avg_P_pred) if ep_avg_P_pred else avg_P_ep  # 예측 (process noise 후)
 
         logger.add(ep_r, avg_l, avg_P_ep, avg_v, avg_k, q_values=avg_q)
+
+        # ── [checkpoint] best: 환경 무관 항상. 이동평균(best_metric_window) 갱신 시 저장 ──
+        _rw = logger.rewards
+        if cfg.save_best_ckpt and _rw:
+            _bw = min(cfg.best_metric_window, len(_rw))
+            _cur_metric = float(np.mean(_rw[-_bw:]))
+            if _cur_metric > best_metric:
+                best_metric, best_ep = _cur_metric, ep
+                save_checkpoint(os.path.join(cfg.outdir, 'best.pt'), theta, theta_target, info,
+                                normalizer, cfg, ep, best_metric, kind='best', theta_2=theta_2)
+        # ── [early stop] solved(최근 early_stop_window ep 평균 ≥ threshold) 도달 시 중단 ──
+        if (_es_active and ep >= cfg.early_stop_min_episodes
+                and len(_rw) >= cfg.early_stop_window):
+            _avg100 = float(np.mean(_rw[-cfg.early_stop_window:]))
+            if _avg100 >= _solved_thr:
+                print(f"[early-stop] ✅ SOLVED @ ep {ep}: avg{cfg.early_stop_window}={_avg100:.1f} "
+                      f"≥ {_solved_thr:g} | best avg{cfg.best_metric_window}={best_metric:.1f}@ep{best_ep} → 중단")
+                save_checkpoint(os.path.join(cfg.outdir, 'solved.pt'), theta, theta_target, info,
+                                normalizer, cfg, ep, _avg100, kind='solved', theta_2=theta_2)
+                early_stopped = True
+                break
+
         theta_norms = compute_layer_theta_norms(theta, info)
         null_ratio, null_abs, signal_abs = compute_advantage_null_ratio(theta, info)
         
@@ -6197,9 +6397,10 @@ def train_srrhuif():
             else:
                 _r_disp = f"{sp.get('current_r_std', cfg.r_init):.1e}"
 
+            _burst_tag = f" | Burst: {cfg._burst_count}" if cfg.use_burst else ""
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | {_qr_label}: {sp.get('current_q_std', cfg.q_init):.1e}/{_r_disp} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
-                  f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | Learn: {_learn_ms:.2f}ms/step ({_learn_upd_ms:.2f}ms/upd) | FB(chol/qr): {FALLBACK_COUNTS['chol_1e5']}/{FALLBACK_COUNTS['tria_qr']} | Time: {time.time()-ep_start:.2f}s")
+                  f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | Learn: {_learn_ms:.2f}ms/step ({_learn_upd_ms:.2f}ms/upd){_burst_tag} | Time: {time.time()-ep_start:.2f}s")
 
             # ── 호라이즌 진행에 따른 P 변화 (각 fold: 사후 P 대각의 max/min) — 항상 출력 ──
             if last_h_p_traj:
@@ -6216,7 +6417,7 @@ def train_srrhuif():
             if cfg.use_adaptive_r and ep_r_eff:
                 _r_mean = float(np.mean(ep_r_eff))
                 _r_lo, _r_hi = float(np.min(ep_r_eff)), float(np.max(ep_r_eff))
-                print(f"          └─▶ R(adaptive): mean={_r_mean:.2e}  range[{_r_lo:.2e}, {_r_hi:.2e}]  (r_init={cfg.r_init:g} 무시됨)")
+                print(f"          └─▶ R(adaptive): mean={_r_mean:.2e}  range[{_r_lo:.2e}, {_r_hi:.2e}]")
 
             # ── [UT α-Analysis] alpha의 spread/중심가중치 ↔ 활성화 결합 종합 — txt 기록 + 시계열 저장 ──
             if cfg.diag_alpha_analysis:
@@ -6232,8 +6433,6 @@ def train_srrhuif():
                 logger.add_alpha_diag(ep, _ut_metrics)  # PNG용 시계열 누적
 
             # ── [분석 레이어] 핵심 원인 진단(VERDICT) + verbosity gating ──
-            _fb_delta = (FALLBACK_COUNTS['chol_1e5'] - _PREV_FB['chol_1e5']) \
-                      + (FALLBACK_COUNTS['tria_qr'] - _PREV_FB['tria_qr'])
             _eff_ref = (cfg.shared_layers[-1] * 0.3) if cfg.shared_layers else None
             _diag_data = {
                 'gain_h': last_h_gain_traj, 'amp_layer_h': last_h_layer_amp,
@@ -6242,7 +6441,7 @@ def train_srrhuif():
                 'k_traj': last_h_k_traj, 'innov_decomp': last_h_innov_decomp,
                 'dead_ratio': (act_health['__total__']['dead_ratio'] if act_health else None),
                 'eff_rank': eff_rank_val, 'eff_rank_ref': _eff_ref,
-                'argmax_flip': avg_argmax_flip, 'max_innov': max_i_max, 'fb_delta': _fb_delta,
+                'argmax_flip': avg_argmax_flip, 'max_innov': max_i_max,
             }
             _verdicts, _culprit, _trend = build_log_diagnosis(_diag_data, cfg)
             if _verdicts:
@@ -6251,7 +6450,6 @@ def train_srrhuif():
             else:
                 file_print(f"        ⚑ VERDICT: OK")
             file_print(f"        trend: {_trend}")
-            _PREV_FB['chol_1e5'], _PREV_FB['tria_qr'] = FALLBACK_COUNTS['chol_1e5'], FALLBACK_COUNTS['tria_qr']
 
             verbose = (cfg.diag_log_mode == 'always') or (cfg.diag_log_mode == 'auto' and len(_verdicts) > 0)
             dprint = file_print if verbose else (lambda *a, **k: None)
@@ -6368,6 +6566,12 @@ def train_srrhuif():
             if verbose and ref_q:
                 file_print(f"          └─▶ Ref states:        " + " ".join([f"{name}:ΔQ={ref_q[name]['dq']:+.4f}(a={ref_q[name]['argmax']})" for name in REF_NAMES]))
 
+    # [checkpoint] 학습 종료 요약 — best는 항상 best.pt, solved 도달 시 solved.pt
+    if cfg.save_best_ckpt and best_ep > 0:
+        print(f"[ckpt] best avg{cfg.best_metric_window}={best_metric:.1f} @ep{best_ep} "
+              f"→ {os.path.join(cfg.outdir, 'best.pt')}"
+              + ("  | early-stopped → solved.pt" if early_stopped else ""))
+
     logger.total_time = time.time() - train_start_time
     logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0
     # [timing] 순수 파라미터 학습 시간: 필터 step 1회(=1 fold) / 업데이트이벤트(=N_horizon folds)
@@ -6459,6 +6663,22 @@ def train_adam():
     prev_buf_saturated = False
     prev_ep_delta = None
 
+    # [burst robustness] 카운터 리셋 + 설정 배너
+    cfg._burst_count = 0
+    if cfg.use_burst:
+        _bmode = "버퍼저장(O, 지속)" if cfg.burst_store_in_buffer else "일시오염(X, transient)"
+        print(f"[burst] ON | ep[{cfg.burst_ep_start}-{cfg.burst_ep_end}] "
+              f"prob={cfg.burst_prob:g} value=±{cfg.burst_value:g}({cfg.burst_sign}) | {_bmode}")
+
+    # [checkpoint & early stop] best는 환경 무관 항상, early stop은 env solved 기준(compare면 비활성)
+    best_metric, best_ep, early_stopped = -float('inf'), -1, False
+    _solved_thr = cfg._solved_threshold
+    _es_active = (cfg.use_early_stop and not cfg._in_compare and _solved_thr is not None)
+    _es_msg = (f"avg{cfg.early_stop_window}≥{_solved_thr:g}(min_ep={cfg.early_stop_min_episodes})"
+               if _es_active else ("off(compare)" if cfg._in_compare else "off"))
+    print(f"[ckpt] best: {'on(avg%d)' % cfg.best_metric_window if cfg.save_best_ckpt else 'off'} "
+          f"| early-stop: {_es_msg}")
+
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=env_seed + ep)
         buffer.set_current_episode(ep)
@@ -6509,12 +6729,29 @@ def train_adam():
             else:
                 a = int(q_vals.argmax().item())
             ns, r, done, trunc, _ = env.step(a)
-            buffer.push(s, a, r / cfg.scale_factor, ns, done)
+            # [burst-O] 버퍼 저장 경로: 오염된 r을 버퍼에 영구 저장 (지속적 outlier)
+            r_store = r
+            if (cfg.use_burst and cfg.burst_store_in_buffer
+                    and cfg.burst_ep_start <= ep <= cfg.burst_ep_end
+                    and np.random.rand() < cfg.burst_prob):
+                r_store = r + burst_delta_scalar(cfg)
+                cfg._burst_count += 1
+            buffer.push(s, a, r_store / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
             if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.adam_update_interval == 0:
                 t_upd = time.perf_counter()
                 batch = buffer.sample_batch(cfg.batch_size)
+                # [burst-X] 일시 오염 경로: 버퍼는 클린, 이 batch의 measurement만 오염
+                if (cfg.use_burst and not cfg.burst_store_in_buffer
+                        and cfg.burst_ep_start <= ep <= cfg.burst_ep_end):
+                    _bmask = torch.rand(cfg.batch_size, device=batch['r'].device) < cfg.burst_prob
+                    _nb = int(_bmask.sum().item())
+                    if _nb > 0:
+                        _bd = burst_deltas_tensor(cfg, _nb, batch['r'].device) / cfg.scale_factor
+                        batch['r'] = batch['r'].clone()
+                        batch['r'][_bmask] += _bd.to(batch['r'].dtype)
+                        cfg._burst_count += _nb
 
                 adam_opt.zero_grad(set_to_none=True)
                 loss = compute_adam_td_loss(theta_param, theta_target, batch, sp, cfg)
@@ -6552,6 +6789,27 @@ def train_adam():
 
         # filter-specific은 0으로 (LivePlotter 시그니처 유지)
         logger.add(ep_r, avg_l, 0.0, 0.0, 0.0, q_values=avg_q)
+
+        # ── [checkpoint] best: 환경 무관 항상. 이동평균(best_metric_window) 갱신 시 저장 ──
+        _rw = logger.rewards
+        if cfg.save_best_ckpt and _rw:
+            _bw = min(cfg.best_metric_window, len(_rw))
+            _cur_metric = float(np.mean(_rw[-_bw:]))
+            if _cur_metric > best_metric:
+                best_metric, best_ep = _cur_metric, ep
+                save_checkpoint(os.path.join(cfg.outdir, 'best.pt'), theta, theta_target, info,
+                                normalizer, cfg, ep, best_metric, kind='best')
+        # ── [early stop] solved(최근 early_stop_window ep 평균 ≥ threshold) 도달 시 중단 ──
+        if (_es_active and ep >= cfg.early_stop_min_episodes
+                and len(_rw) >= cfg.early_stop_window):
+            _avg100 = float(np.mean(_rw[-cfg.early_stop_window:]))
+            if _avg100 >= _solved_thr:
+                print(f"[early-stop] ✅ SOLVED @ ep {ep}: avg{cfg.early_stop_window}={_avg100:.1f} "
+                      f"≥ {_solved_thr:g} | best avg{cfg.best_metric_window}={best_metric:.1f}@ep{best_ep} → 중단")
+                save_checkpoint(os.path.join(cfg.outdir, 'solved.pt'), theta, theta_target, info,
+                                normalizer, cfg, ep, _avg100, kind='solved')
+                early_stopped = True
+                break
 
         # 공통 진단들
         theta_norms = compute_layer_theta_norms(theta, info)
@@ -6652,6 +6910,12 @@ def train_adam():
             if ref_q:
                 file_print(f"          └─▶ Ref states:        " + " ".join([f"{name}:ΔQ={ref_q[name]['dq']:+.4f}(a={ref_q[name]['argmax']})" for name in REF_NAMES]))
 
+    # [checkpoint] 학습 종료 요약 — best는 항상 best.pt, solved 도달 시 solved.pt
+    if cfg.save_best_ckpt and best_ep > 0:
+        print(f"[ckpt] best avg{cfg.best_metric_window}={best_metric:.1f} @ep{best_ep} "
+              f"→ {os.path.join(cfg.outdir, 'best.pt')}"
+              + ("  | early-stopped → solved.pt" if early_stopped else ""))
+
     logger.total_time = time.time() - train_start_time
     logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0
     env.close()
@@ -6748,6 +7012,7 @@ def run_comparison():
     saved_tf32 = cfg.use_tf32_forward
     base_results_dir = None
     results = {}
+    cfg._in_compare = True  # [early stop] compare는 공정 비교 위해 조기중단 비활성(best ckpt는 유지)
     for label, mode in (('RHUKF', 'filter'), ('ADAM', 'adam')):
         cfg.use_tf32_forward = saved_tf32      # Adam이 끈 TF32를 RHUKF용으로 복원
         cfg.train_mode = mode
