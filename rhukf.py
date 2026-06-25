@@ -519,6 +519,12 @@ class Config:
     #   'default' = inductor 기본 / 'max-autotune' = 더 공격적 튜닝(컴파일 느림)
     #   실패하면 자동 eager fallback. FV covariance 시그마 앙상블 forward가 주 수혜.
     compile_mode: str = 'reduce-overhead'
+    # [fast] 학습 전용 고속 모드. ON이면:
+    #   (1) 모든 diag_* 진단 OFF (시그마/활성화 프로브의 추가 forward 제거),
+    #   (2) 필터 step의 진단 .item() 스킵 + per-fold 타이밍 sync(torch.cuda.synchronize) 제거,
+    #   (3) per-fold 진단 누적·풀 로그 생략 → 호라이즌 루프가 sync-free → compile 가속이 실제로 반영.
+    #   디버깅/분석은 fast=False(기본)로. 학습만 빠르게 돌릴 땐 --fast.
+    fast: bool = False
     plot_interval: int = 60
     log_interval : int = 1
 
@@ -775,6 +781,14 @@ class Config:
 
         if self.early_stop_mode not in {'freeze', 'stop'}:
             raise ValueError(f"early_stop_mode='{self.early_stop_mode}' invalid. Must be 'freeze' or 'stop'.")
+
+        # [fast] 학습 전용 모드: 모든 진단 toggle off (추가 forward·sync 제거). 디버깅은 fast=False.
+        if self.fast:
+            for _df in ('diag_ref_states', 'diag_argmax_flip', 'diag_eff_rank', 'diag_horizon_cond',
+                        'diag_buffer', 'diag_act_health', 'diag_act_regime', 'diag_sigma_spread',
+                        'diag_alpha_analysis', 'diag_layer_r'):
+                setattr(self, _df, False)
+            self.diag_log_mode = 'summary'
 
         # [P anneal] 검증: min ≤ start(MAX)
         if self.anneal_p:
@@ -1228,6 +1242,11 @@ parser.add_argument('--early_stop_min_episodes', type=int, default=cfg.early_sto
                     help="이 에피소드 이후부터만 중단 허용 (default %(default)s)")
 parser.add_argument('--early_stop_mode', type=str, default=cfg.early_stop_mode, choices=['freeze', 'stop'],
                     help="solved 시: 'freeze'=학습만 동결·max_ep까지 지속(기본) / 'stop'=즉시 종료")
+parser.add_argument('--fast', dest='fast', action='store_true', default=cfg.fast,
+                    help="학습 전용 고속 모드: 모든 진단 OFF + per-fold sync/.item() 제거 (compile 가속 반영). "
+                         "config의 fast 기본값을 CLI로 켬.")
+parser.add_argument('--no_fast', dest='fast', action='store_false',
+                    help="고속 모드 끔(풀 진단). config에서 fast=True여도 이걸로 디버깅용 전환.")
 parser.add_argument('--no_compile', dest='use_compile', action='store_false', default=cfg.use_compile,
                     help="torch.compile 비활성 (기본은 ON). 디버깅/호환 문제 시 사용.")
 parser.add_argument('--compile_mode', type=str, default=cfg.compile_mode,
@@ -1353,6 +1372,7 @@ cfg.early_stop_window = args.early_stop_window
 cfg.early_stop_threshold = args.early_stop_threshold  # None이면 __post_init__에서 env 기본값
 cfg.early_stop_min_episodes = args.early_stop_min_episodes
 cfg.early_stop_mode = args.early_stop_mode
+cfg.fast = args.fast
 cfg.use_compile = args.use_compile
 cfg.compile_mode = args.compile_mode
 
@@ -4577,7 +4597,7 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     # z_hat (FINAL Z_sigma_T)
     z_hat = (fv_cache.Wm.view(-1, 1) * Z_sigma_T).sum(dim=0, keepdim=True).t()  # [B, 1]
     
-    target_var = torch.var(z_measured).item()
+    target_var = 0.0 if sp.get('_fast', False) else torch.var(z_measured).item()
     residual = z_measured - z_hat  # [B, 1]
     # [burst-X] TD-error 직접 주입 (target−prediction 부호 → +outlier)
     _tb = batch.get('_td_burst')
@@ -4640,7 +4660,13 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     
     # ── Final ───────────────────────────────────────────────────────
     theta_active = (theta_anchor + mu_delta_new).view(-1, 1)
-    
+    filter_state_new = {'mu_delta': mu_delta_new, 'P_delta': P_delta_new}
+
+    # [fast] 학습 전용 조기반환: 아래 진단 .item()(avg_P/cond/k_gain/innov/dbg…) 전부 스킵.
+    #   loss는 텐서로 반환(루프가 에피소드당 1회만 sync). target_var/k_gain은 0 placeholder.
+    if sp.get('_fast', False):
+        return theta_active, filter_state_new, loss, 0.0, 0.0, {}
+
     # ── Diagnostics ────────────────────────────────────────────────
     P_diag = torch.diagonal(P_delta_new)
     avg_P = P_diag.mean().item()                                  # 사후 (measurement update 후)
@@ -6166,6 +6192,7 @@ def train_srrhuif():
         f_cache = FilterCache(info, cfg, cfg.device)
     
     sp = {'info': info, 'n_x': info['total_params'], 'batch_sz': cfg.batch_size, 'normalizer': normalizer, 'device': cfg.device, 'cfg': cfg}
+    sp['_fast'] = cfg.fast   # [fast] step 함수가 진단 .item() 스킵 여부 판단
     # [layer R] 층별 R 분해용 sigma-index 매핑 (FV covariance + 동적 R + 진단 ON일 때만)
     if (cfg.diag_layer_r and cfg.decoupling_mode == 'fv'
             and cfg.filter_form == 'covariance' and cfg.r_mode in ('adaptive', 'ratio')):
@@ -6513,7 +6540,8 @@ def train_srrhuif():
                         theta_before_h = theta.squeeze().clone()
 
                         # [timing] 순수 파라미터 학습(필터 step) 1-스텝 시간 측정 시작
-                        if _dev_cuda: torch.cuda.synchronize()
+                        #   [fast] per-fold 풀 sync는 직렬화 주범 → fast면 타이밍 측정 자체를 생략.
+                        if _dev_cuda and not cfg.fast: torch.cuda.synchronize()
                         _t_step = time.perf_counter()
 
                         # ── 메인 필터 (θ_1) ──
@@ -6562,6 +6590,11 @@ def train_srrhuif():
                                 theta_2, filter_state_es_2, _, _, _, _ = srrhuif_step_error(
                                     filter_state_es_2, horizon_ctx_2, batch_hist[h], h, sp, cfg, f_cache)
 
+                        # [fast] 학습 전용: 타이밍 sync + per-fold 진단 누적 전부 스킵, loss(텐서)만 모음.
+                        if cfg.fast:
+                            ep_l.append(l_val)   # l_val은 텐서 (에피소드 끝에서 1회 sync)
+                            continue
+
                         # [timing] 필터 step 종료 — 1-스텝 파라미터 학습 시간 누적
                         if _dev_cuda: torch.cuda.synchronize()
                         _step_dt = time.perf_counter() - _t_step
@@ -6574,7 +6607,7 @@ def train_srrhuif():
                             cos = F.cosine_similarity(h_delta.unsqueeze(0), prev_h_delta.unsqueeze(0)).item() if (d_norm > 1e-8 and p_norm > 1e-8) else 0.0
                             h_cos_traj.append(cos)
                         prev_h_delta = h_delta.clone()
-                        
+
                         ep_l.append(l_val); ep_var.append(t_var); ep_k_gain.append(t_k_gain)
                         ep_i_mean.append(dbg['innov_mean']); ep_i_max.append(dbg['innov_max'])
                         ep_avg_P.append(dbg['avg_P'])  # [v6] dynamic P tracking
@@ -6667,9 +6700,13 @@ def train_srrhuif():
         # [video] 지정 에피소드마다 현재 θ로 greedy rollout을 백그라운드 mp4 녹화
         maybe_record_video(theta, info, cfg, ep)
 
-        avg_l = np.mean(ep_l) if ep_l else 0
+        # [fast] ep_l은 텐서 리스트 → 에피소드당 1회만 stack+sync. 그 외 진단은 비어있음(기본값).
+        if cfg.fast:
+            avg_l = (torch.stack(ep_l).mean().item() if ep_l else 0.0)
+        else:
+            avg_l = np.mean(ep_l) if ep_l else 0
         avg_v = np.mean(ep_var) if ep_var else 0
-        avg_k = np.mean(ep_k_gain) if ep_k_gain else 0 
+        avg_k = np.mean(ep_k_gain) if ep_k_gain else 0
         avg_q = [float(np.mean(qa)) if qa else 0.0 for qa in ep_q_actions]  # 행동별 평균 Q
         avg_i_mean = np.mean(ep_i_mean) if ep_i_mean else 0
         max_i_max = np.max(ep_i_max) if ep_i_max else 0
@@ -6774,9 +6811,10 @@ def train_srrhuif():
 
             _burst_tag = (f" | Burst({burst_mode_str(cfg)}): {cfg._burst_count}"
                           if cfg.use_burst else "")
+            _learn_str = "Learn: (fast)" if cfg.fast else f"Learn: {_learn_ms:.2f}ms/step ({_learn_upd_ms:.2f}ms/upd)"
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | {_qr_label}: {sp.get('current_q_std', cfg.q_init):.1e}/{_r_disp} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
-                  f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | Learn: {_learn_ms:.2f}ms/step ({_learn_upd_ms:.2f}ms/upd){_burst_tag} | Time: {time.time()-ep_start:.2f}s")
+                  f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | {_learn_str}{_burst_tag} | Time: {time.time()-ep_start:.2f}s")
 
             # ── 호라이즌 진행에 따른 P 변화 (각 fold: 사후 P 대각의 max/min) — 항상 출력 ──
             if last_h_p_traj:
