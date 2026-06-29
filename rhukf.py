@@ -333,19 +333,12 @@ class Config:
 
 
     # Decoupling Mode 
-    #   'node'  = per-neuron block-diagonal (mean-field, 가장 가벼움)
-    #   'layer' = per-layer joint (K-FAC-like, within-layer covariance 보존)
-    #   'fv'    = full vector (모든 파라미터를 한 블록으로, 가장 정확하지만 무거움)
     decoupling_mode: str = 'fv'
 
     filter_form: str = 'covariance' # information or covariance
     measurement_mode: str = 'q_target' # q_target or pure_reward
 
     # [filter_reset ablation] 빠른 경로(P) 리셋 유무 — SWRL의 "sliding window 기여" 고립 증명용.
-    #   True  (reset ON, =SWRL)        : 매 호라이즌 P를 prior(p_delta_init·I)로 리셋 → FIR 빠른 경로.
-    #   False (reset OFF, =filter_noreset): P를 호라이즌 간 이어받음 → 빠른 경로도 IIR (P 누적/발산 관찰).
-    #   둘 다 동일 RHUKF·동일 앵커(θ_target IIR)·Δμ는 매 호라이즌 재앵커 → 차이는 오직 P 리셋.
-    #   (error-state FV covariance 경로 전용. 다른 decoupling/form은 항상 reset.)
     filter_reset: bool = True
 
     # [v7: Anchor type] state_form='error'에서 θ_anchor 결정 방식
@@ -412,8 +405,8 @@ class Config:
     batch_size: int = 128
     N_horizon: int = 6
     
-    q_init: float = 1e-5
-    q_end: float = 1e-5
+    q_init: float = 1e-3
+    q_end: float = 1e-3
 
     r_init: float = 1.5
     r_end: float = 1.5
@@ -421,18 +414,15 @@ class Config:
     # [RHUKF robust] 두 가지 독립 Huber 로직 (각각 토글 + 임계 c):
     #   ① Huber R       : |innovation|>c면 측정노이즈 R 인플레(R_eff=R_base·max(|res|/c,1)) → 게인↓로 outlier 다운웨이트.
     #   ② Huber residual: 상태 보정에 들어가는 innovation을 [-c,c]로 클립(K@clip(res)) → 보정 크기 직접 제한.
-    #   둘 다 OFF면 순수 RHUKF(방어 없음). 둘 다 ON이면 R 다운웨이트 + 보정 클립 이중.
+
     use_huber_r: bool = True
-    huber_r_c: float = 5
+    huber_r_c: float = 7
     use_huber_residual: bool = True
     huber_residual_c: float = 10.0
-    _huber_r_c_eff: float = 5    # 런타임 파생: use_huber_r면 huber_r_c, 아니면 1e30(인플레 무효=adapt_factor 1)
+    _huber_r_c_eff: float = 5
 
-    # [처방 A] 적응형 R (게인 브레이크) — covariance form 전용.
-  
     r_mode: str = 'fixed' # fixed / adaptive / innovation
     innov_r_beta: float = 3       # innovation 모드 β: R = R_min(=adaptive_r_min) + β·mean(residual²)
-
     innov_var_eps: float = 1e-1     # ratio 모드 ε: max(Var(innov), ε) 분모 하한 (완전 수렴 시 R 폭발 방지·gain↓ 상한 결정)
 
     use_adaptive_r: bool = False    # [파생] r_mode != 'fixed' 이면 True (직접 설정  — r_mode가 진실원천)
@@ -444,27 +434,34 @@ class Config:
     anneal_p: bool = False
     state_form: str = 'error' # absolute or error
     p_init: float = 0.01
-    p_delta_init: float = 0.07
+    p_delta_init: float = 0.01
 
-    p_init_min: float = 0.02      
-    p_delta_min: float = 0.01     
+    p_init_min: float = 0.01  
+    p_delta_min: float = 0.01  
 
     alpha: float = 0.1
     beta: float = 2.0
     kappa: float = 0.0
 
-    seed: int = 42
-    network_seed: Optional[int] = 42
-    env_seed: Optional[int] = 42
+    seed: int = 1
+    network_seed: Optional[int] = 1
+    env_seed: Optional[int] = 1
 
     use_n_step: bool = True
     n_step_size: int = 3
 
     fast: bool = True #로그 ON/OFF
 
-    train_mode: str = 'filter' # 'filter'(RHUKF) | 'adam'(DDQN baseline) | 'compare'(둘 다 실행→비교 결과 내보냄)
+    # 'filter'(RHUKF) | 'adam'(Adam baseline) | 'sgd'(SGD baseline, =adam+baseline_opt=sgd) | 'compare'(RHUKF vs baseline)
+    train_mode: str = 'adam'
     use_adam_warmup: bool = False
-    adam_lr: float = 8e-4
+    # [baseline 옵티마이저] gradient baseline(train_mode='adam' 경로)의 옵티마이저 선택.
+    #   'adam' = Adam(m/√v 정규화 → 스텝 정규화) / 'sgd' = SGD(정규화 없음, momentum로 누적 조절)
+    #   Huber loss(adam_use_huber)는 둘 다에 적용됨(loss 레벨). lr은 adam_lr 공유.
+    baseline_opt: str = 'adam'
+    sgd_momentum: float = 0.0          # SGD momentum (0=순수 SGD/누적 없음, 0.9=모멘텀 누적). baseline_opt='sgd'일 때만.
+    _baseline_label: str = 'ADAM'      # 런타임 파생: 'ADAM' 또는 'SGD'
+    adam_lr: float = 3e-4
     adam_tau: float = 0.005            # Adam soft target Polyak 계수 (표준 DDQN)
     adam_update_interval: int = 1      # Adam은 매 env 스텝 업데이트
     adam_force_fp32: bool = True       # Adam baseline은 TF32 끄고 FP32 (공정성/재현성)
@@ -472,7 +469,7 @@ class Config:
     adam_lr_anneal: bool = False        # 에피소드 진행에 따라 Adam lr 감쇠
 
     # [Adam Huber] Adam loss robust-loss. adam_use_huber로 on/off, adam_huber_delta로 δ값 (단일 노브).
-    adam_use_huber: bool = False        # True=Huber(δ=adam_huber_delta) / False=MSE
+    adam_use_huber: bool = True        # True=Huber(δ=adam_huber_delta) / False=MSE
     adam_huber_delta: float = 5.0       # Adam Huber δ (adam_use_huber=True일 때만 사용)
 
     warmup_step : int = 0
@@ -481,7 +478,7 @@ class Config:
     use_burst: bool = False
     burst_target: str = 'td_error'        # 'reward'(보상 r→y) | 'td_error'(TD target/잔차 직접). TD target 주입은 td_error 권장.
 
-    burst_windows: List[List[int]] = field(default_factory=lambda: [[55, 57], [67, 70], [85, 90]])
+    burst_windows: List[List[int]] = field( default_factory=lambda: [[65, 70], [85, 90], [105,110]])
     burst_prob: float = 0.1             # 주입 확률 (persistent: env step당 / transient: update 이벤트당)
     burst_value: float = 10.0           # 가산 오차 크기 (scale_factor 적용 전 reward 단위)
     burst_sign: str = 'random'          # 'random'(±) | 'pos'(+only) | 'neg'(-only)
@@ -724,14 +721,21 @@ class Config:
                 )
         
         # [v9+] Train mode 검증
-        valid_train_mode = {'filter', 'adam', 'compare'}
+        valid_train_mode = {'filter', 'adam', 'sgd', 'compare'}
         if self.train_mode not in valid_train_mode:
             raise ValueError(
                 f"train_mode='{self.train_mode}' invalid. Must be one of {valid_train_mode}."
             )
-        if self.train_mode == 'adam' and self.use_twin:
+        # [train_mode='sgd'] = gradient baseline(adam 경로) + SGD 옵티마이저 단축 → baseline_opt를 sgd로 강제.
+        if self.train_mode == 'sgd':
+            self.baseline_opt = 'sgd'
+        # [baseline 옵티마이저] adam/sgd 검증 + 라벨 파생 (param_str/로그/compare에서 사용)
+        if self.baseline_opt not in {'adam', 'sgd'}:
+            raise ValueError(f"baseline_opt='{self.baseline_opt}' invalid. Must be 'adam' or 'sgd'.")
+        self._baseline_label = 'SGD' if self.baseline_opt == 'sgd' else 'ADAM'
+        if self.train_mode in ('adam', 'sgd') and self.use_twin:
             raise ValueError(
-                "train_mode='adam'는 use_twin=True와 비호환 "
+                "train_mode='adam'/'sgd'는 use_twin=True와 비호환 "
                 "(Twin은 filter Y_cache 공유 구조 전제)."
             )
 
@@ -869,9 +873,12 @@ class Config:
             r_tag = f"rRat{self.adaptive_r_lambda:g}-{self.adaptive_r_min:g}e{self.innov_var_eps:g}"
         else:  # 'fixed'
             r_tag = f"r{self.r_init:g}"
-        if self.train_mode == 'adam':
+        if self.train_mode in ('adam', 'sgd'):
+            _opt_tag = (f"SGD_lr{self.adam_lr:g}m{self.sgd_momentum:g}" if self.baseline_opt == 'sgd'
+                        else f"ADAM_lr{self.adam_lr:g}")
+            _hub_tag = (f"_hub{self.adam_huber_delta:g}" if self.adam_use_huber else "_mse")
             self.param_str = (
-                f"ADAM_lr{self.adam_lr:g}_b{self.batch_size}_{net_tag}_s{self.network_seed}{burst_tag}"
+                f"{_opt_tag}{_hub_tag}_b{self.batch_size}_{net_tag}_s{self.network_seed}{burst_tag}"
             )
         else:
             self.param_str = (
@@ -1221,8 +1228,12 @@ parser.add_argument('--advantage_layers', type=int, nargs='*', default=None,
 parser.add_argument('--q_layers', type=int, nargs='*', default=None,
                     help="Q head hidden layer sizes (non-dueling 시)")
 parser.add_argument('--train_mode', type=str, default=cfg.train_mode,
-                    choices=['filter', 'adam', 'compare'],
-                    help="[v9+] 'filter'=SRRHUKF/RHUKF, 'adam'=순수 Adam DDQN, 'compare'=둘 다 돌려 비교 결과 내보냄")
+                    choices=['filter', 'adam', 'sgd', 'compare'],
+                    help="'filter'=RHUKF, 'adam'=Adam baseline, 'sgd'=SGD baseline, 'compare'=RHUKF vs baseline")
+parser.add_argument('--baseline_opt', type=str, default=cfg.baseline_opt, choices=['adam', 'sgd'],
+                    help="gradient baseline 옵티마이저: adam(정규화) / sgd(정규화 없음). train_mode=adam/compare에서 사용.")
+parser.add_argument('--sgd_momentum', type=float, default=cfg.sgd_momentum,
+                    help="SGD momentum (0=순수 SGD, 0.9=모멘텀 누적; baseline_opt=sgd일 때만, default %(default)s)")
 parser.add_argument('--use_adam_warmup', dest='use_adam_warmup', action='store_true', default=cfg.use_adam_warmup,
                     help="[v9+] batch_hist가 가득 차기 전(filter 시작 전) 구간에 Adam으로 θ 업데이트")
 parser.add_argument('--no_adam_warmup', dest='use_adam_warmup', action='store_false',
@@ -1393,6 +1404,8 @@ cfg.use_adam_warmup = args.use_adam_warmup
 cfg.adam_lr = args.adam_lr
 cfg.adam_tau = args.adam_tau
 cfg.adam_update_interval = args.adam_update_interval
+cfg.baseline_opt = args.baseline_opt
+cfg.sgd_momentum = args.sgd_momentum
 cfg.adam_use_huber = args.adam_use_huber
 cfg.diag_adam_internals = args.diag_adam_internals
 cfg.adam_huber_delta = args.adam_huber_delta
@@ -7142,7 +7155,15 @@ def train_adam():
     theta_target = theta.clone()
 
     theta_param = nn.Parameter(theta.squeeze().clone().detach(), requires_grad=True)
-    adam_opt = torch.optim.Adam([theta_param], lr=cfg.adam_lr)
+    # [baseline 옵티마이저] Adam(정규화) vs SGD(정규화 없음, momentum로 누적 조절)
+    if cfg.baseline_opt == 'sgd':
+        adam_opt = torch.optim.SGD([theta_param], lr=cfg.adam_lr, momentum=cfg.sgd_momentum)
+        _opt_desc = f"SGD(lr={cfg.adam_lr:g}, momentum={cfg.sgd_momentum:g})"
+    else:
+        adam_opt = torch.optim.Adam([theta_param], lr=cfg.adam_lr)
+        _opt_desc = f"Adam(lr={cfg.adam_lr:g})"
+    print(f"[baseline] optimizer = {_opt_desc} | loss = "
+          + (f"Huber(δ={cfg.adam_huber_delta:g})" if cfg.adam_use_huber else "MSE"))
 
     analyze_initial_network(theta, info, env, cfg, normalizer)
 
@@ -7386,7 +7407,7 @@ def train_adam():
 
             _burst_tag = (f" | Burst({burst_mode_str(cfg)}): {cfg._burst_count}"
                           if cfg.use_burst else "")
-            print(f"[ADAM] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} "
+            print(f"[{cfg._baseline_label}] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} "
                   f"| Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
                   f"| Loss: {avg_l:.4f} | lr: {cur_lr:.1e} "
                   f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] "
@@ -7469,9 +7490,9 @@ def train_adam():
 
     logger.close()
     _rec = compute_recovery_metric(list(logger.rewards), cfg)
-    print_recovery_metric(_rec, 'ADAM')
+    print_recovery_metric(_rec, cfg._baseline_label)
     return {  # [compare] 비교 하네스용 메트릭
-        'label': 'ADAM', 'rewards': list(logger.rewards), 'losses': list(logger.losses),
+        'label': cfg._baseline_label, 'rewards': list(logger.rewards), 'losses': list(logger.losses),
         'avg_update_ms': logger.avg_step_time, 'total_time': logger.total_time,
         'param_str': cfg.param_str, 'outdir': cfg.outdir, 'recovery': _rec,
     }
@@ -7484,7 +7505,9 @@ def _export_comparison(results, compare_dir):
     """두 모드 메트릭을 CSV + 비교 플롯 + 요약으로 내보냄."""
     import csv
     os.makedirs(compare_dir, exist_ok=True)
-    rh, ad = results.get('RHUKF'), results.get('ADAM')
+    rh = results.get('RHUKF')
+    ad = next((v for k, v in results.items() if k != 'RHUKF'), None)  # baseline (ADAM 또는 SGD)
+    _blabel = ad['label'] if ad else 'BASE'
 
     # ── per-episode CSV ──
     n = min(len(rh['rewards']), len(ad['rewards'])) if (rh and ad) else 0
@@ -7498,8 +7521,8 @@ def _export_comparison(results, compare_dir):
     # ── 요약 (final avg100 reward, 업데이트 시간, 총 시간) ──
     def _avg_tail(xs, k=100):
         return float(np.mean(xs[-k:])) if xs else 0.0
-    summary_lines = ["=== RHUKF vs Adam comparison ==="]
-    for label, m in (('RHUKF', rh), ('ADAM', ad)):
+    summary_lines = [f"=== RHUKF vs {_blabel} comparison ==="]
+    for label, m in (('RHUKF', rh), (_blabel, ad)):
         if m is None: continue
         summary_lines.append(
             f"[{label}] final_avg100_reward={_avg_tail(m['rewards']):.1f} | "
@@ -7507,7 +7530,7 @@ def _export_comparison(results, compare_dir):
             f"avg_update={m['avg_update_ms']:.2f} ms | total_wall={m['total_time']:.1f} s | "
             f"final_loss={m['losses'][-1] if m['losses'] else float('nan'):.4f}")
     if rh and ad and ad['avg_update_ms'] > 0:
-        summary_lines.append(f"[speed] RHUKF/Adam update-time ratio = {rh['avg_update_ms']/ad['avg_update_ms']:.2f}x "
+        summary_lines.append(f"[speed] RHUKF/{_blabel} update-time ratio = {rh['avg_update_ms']/ad['avg_update_ms']:.2f}x "
                              f"(>1 이면 RHUKF가 업데이트당 더 느림)")
     # ── [burst robustness] 회복속도 비교 (recovery_lag 작을수록 robust) ──
     def _fmt_rec(m):
@@ -7520,12 +7543,12 @@ def _export_comparison(results, compare_dir):
     _rh_rec = rh.get('recovery') if rh else None
     if _rh_rec is not None and _rh_rec.get('baseline') is not None:
         summary_lines.append("--- burst recovery (회복속도) ---")
-        for label, m in (('RHUKF', rh), ('ADAM', ad)):
+        for label, m in (('RHUKF', rh), (_blabel, ad)):
             summary_lines.append(f"[{label}] recovery: {_fmt_rec(m)}")
         _rl, _al = (rh['recovery'].get('recovery_lag'), ad['recovery'].get('recovery_lag')) if (rh and ad) else (None, None)
         if _rl is not None and _al is not None:
-            _winner = "RHUKF" if _rl < _al else ("ADAM" if _al < _rl else "tie")
-            summary_lines.append(f"[recovery] RHUKF lag={_rl} vs ADAM lag={_al} → faster: {_winner}")
+            _winner = "RHUKF" if _rl < _al else (_blabel if _al < _rl else "tie")
+            summary_lines.append(f"[recovery] RHUKF lag={_rl} vs {_blabel} lag={_al} → faster: {_winner}")
     summary = "\n".join(summary_lines)
     print("\n" + summary)
     with open(os.path.join(compare_dir, "compare_summary.txt"), 'w', encoding='utf-8') as f:
@@ -7542,13 +7565,13 @@ def _export_comparison(results, compare_dir):
             _wins = cfg.burst_windows
             for _i, (_s, _e) in enumerate(_wins):
                 ax.axvspan(_s, _e, color='red', alpha=0.15, zorder=0, label='burst' if _i == 0 else None)
-        for label, m, c in (('RHUKF', rh, 'C0'), ('ADAM', ad, 'C1')):
+        for label, m, c in (('RHUKF', rh, 'C0'), (_blabel, ad, 'C1')):
             if m and m['rewards']:
                 ax.plot(m['rewards'], color=c, alpha=0.25)
                 ma = _ma(m['rewards']); ax.plot(range(len(m['rewards'])-len(ma), len(m['rewards'])), ma, color=c, lw=2, label=label)
         ax.set_title('Episode Reward (MA20)'); ax.set_xlabel('Episode'); ax.legend(); ax.grid(alpha=0.3)
         ax = axes[0, 1]
-        for label, m, c in (('RHUKF', rh, 'C0'), ('ADAM', ad, 'C1')):
+        for label, m, c in (('RHUKF', rh, 'C0'), (_blabel, ad, 'C1')):
             if m and m['losses']: ax.plot(m['losses'], color=c, lw=1.5, label=label)
         ax.set_yscale('log'); ax.set_title('Loss'); ax.set_xlabel('Episode'); ax.legend(); ax.grid(alpha=0.3)
         ax = axes[1, 0]
@@ -7576,10 +7599,11 @@ def run_comparison():
     base_results_dir = None
     results = {}
     cfg._in_compare = True  # [early stop] compare는 공정 비교 위해 조기중단 비활성(best ckpt는 유지)
-    for label, mode in (('RHUKF', 'filter'), ('ADAM', 'adam')):
+    for mode in ('filter', 'adam'):
         cfg.use_tf32_forward = saved_tf32      # Adam이 끈 TF32를 RHUKF용으로 복원
         cfg.train_mode = mode
-        cfg.__post_init__()                    # param_str/outdir를 모드별로 재계산 (폴더 충돌 방지)
+        cfg.__post_init__()                    # param_str/outdir·_baseline_label 모드별 재계산 (폴더 충돌 방지)
+        label = 'RHUKF' if mode == 'filter' else cfg._baseline_label  # baseline은 ADAM/SGD 동적
         if base_results_dir is None:
             base_results_dir = os.path.dirname(cfg.outdir)
         prepare_outdir(cfg.outdir)             # 모드별 결과 폴더 새로 비우고 생성 (로그 열기 전)
@@ -7605,7 +7629,7 @@ if __name__ == "__main__":
         else:
             prepare_outdir(cfg.outdir)  # run 시작: 결과 폴더 새로 비우고 생성 (로그 열기 전)
             if cfg.save_file_log: setup_file_logging(os.path.join(cfg.outdir, "training_log.txt"))
-            if cfg.train_mode == 'adam':
+            if cfg.train_mode in ('adam', 'sgd'):   # gradient baseline (옵티마이저는 baseline_opt)
                 train_adam()
             else:
                 train_srrhuif()
