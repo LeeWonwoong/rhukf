@@ -216,44 +216,64 @@ def huber_clip_residual(residual, cfg):
     return residual
 
 
-def log_burst_filter_action(residual, _tb, adapt_factor, R_base, cfg, h_idx, tag='rhukf-fv-es'):
-    """[burst-filt] burst 주입(_td_burst) 시 두 robust 기전이 '그 배치 잔차'에 실제로
-    어떻게 걸렸는지 1줄로 보여준다 — fast mode에서도 호출됨(진단 조기반환 이전에 박음).
-      ① Huber residual clip : K@res에 들어가는 innovation을 [-c,c]로 클립 → "res 몇→몇"
-      ② Huber R             : R_eff = R_base·max(|res|/c_R,1) → "R_base 몇→×factor→R_eff"
-    인자:
-      residual    : post-burst innovation [B,1] (= clean 잔차 + _td_burst)
-      _tb         : 이 배치에 주입된 ±burst_value 텐서 [B]
-      adapt_factor: Huber R 인플레 계수 [B] (=max(|res|/c_R,1), 또는 IS-R 경로면 w^-β)
-      R_base      : 이 스텝 base 측정분산 (scalar; 적응형이면 동적값)
-    배치 전체가 burst라 대표로 |post-burst 잔차|가 가장 큰 샘플 1개를 풀어 보여주고,
-    배치 집계(클립된 수 / R 인플레된 수 / 평균 인플레)를 덧붙인다."""
+def accumulate_burst_filter(sp, residual, _tb, adapt_factor, R_base, cfg):
+    """[burst-filt] burst 주입(_td_burst) fold마다 robust 기전 동작을 sp['_burst_acc']에 누적.
+    fold당 print 대신 에피소드 끝에서 flush_burst_filter_log가 1줄로 요약(보기 편함).
+      ① Huber residual clip : K@res innovation을 [-c,c]로 클립
+      ② Huber R             : R_eff = R_base·max(|res|/c_R,1)
+    누적: fold 수 / 총 샘플·클립·R인플레 수 / 평균·최대 인플레 / 에피소드 worst 샘플(res→clip)."""
     if not (cfg.diag_burst_filter and _tb is not None):
         return
     with torch.no_grad():
         res = residual.reshape(-1)
-        tb = _tb.reshape(-1).to(res.dtype)
-        res_clean = res - tb                       # 주입 전(클린) 잔차
+        af = adapt_factor.reshape(-1)
+        res_abs = res.abs()
         use_clip = cfg.use_huber_residual
         c_res = cfg.huber_residual_c if use_clip else float('inf')
-        res_clip = torch.clamp(res, -c_res, c_res) if use_clip else res
-        af = adapt_factor.reshape(-1)
-        c_R = cfg._huber_r_c_eff
-        i = int(torch.argmax(res.abs()).item())    # 가장 극단적인 샘플
         n = res.numel()
-        n_clipped = int((res.abs() > c_res).sum().item()) if use_clip else 0
+        n_clipped = int((res_abs > c_res).sum().item()) if use_clip else 0
         n_rinfl = int((af > 1.0).sum().item())
-        rb = float(R_base)
-        # 스칼라 추출 (.item()은 한 번에)
-        rc, tbi, rpost, rclip, afi = (res_clean[i].item(), tb[i].item(),
-                                      res[i].item(), res_clip[i].item(), af[i].item())
+        mean_res = res_abs.mean().item()
         mean_af = af.mean().item()
-    c_res_str = f"{c_res:g}" if use_clip else "off"
-    print(
-        f"        └─▶ [burst-filt {tag} h{h_idx}] "
-        f"worst#{i}: res {rc:+.3f}{tbi:+.3f}(δ)={rpost:+.3f} ─clip(c={c_res_str})→ {rclip:+.3f} | "
-        f"R {rb:.3f} ─×{afi:.2f}(c_R={c_R:g})→ {rb*afi:.3f} | "
-        f"batch: clipped {n_clipped}/{n}, R↑ {n_rinfl}/{n}, mean×{mean_af:.2f}")
+        i = int(torch.argmax(res_abs).item())          # 이 fold의 극단 샘플
+        worst_res = res[i].item()
+        worst_clip = (max(-c_res, min(c_res, worst_res)) if use_clip else worst_res)
+    acc = sp.get('_burst_acc')
+    if acc is None:
+        acc = {'folds': 0, 'n_smp': 0, 'n_clip': 0, 'n_rinfl': 0,
+               'sum_res': 0.0, 'sum_af': 0.0, 'max_af': 1.0,
+               'worst_abs': -1.0, 'worst_res': 0.0, 'worst_clip': 0.0}
+        sp['_burst_acc'] = acc
+    acc['folds'] += 1
+    acc['n_smp'] += n
+    acc['n_clip'] += n_clipped
+    acc['n_rinfl'] += n_rinfl
+    acc['sum_res'] += mean_res
+    acc['sum_af'] += mean_af
+    acc['max_af'] = max(acc['max_af'], float(af.max().item()))
+    if abs(worst_res) > acc['worst_abs']:
+        acc['worst_abs'] = abs(worst_res)
+        acc['worst_res'] = worst_res
+        acc['worst_clip'] = worst_clip
+
+
+def flush_burst_filter_log(sp, cfg):
+    """[burst-filt] 에피소드 누적 burst 흡수 통계를 1줄로 출력하고 리셋. burst 없던 에피소드는 무출력.
+    fast mode에서도 호출됨(Ep 요약줄 직후)."""
+    acc = sp.get('_burst_acc')
+    if not acc or acc['folds'] == 0:
+        sp['_burst_acc'] = None
+        return
+    f = acc['folds']
+    clip_pct = 100.0 * acc['n_clip'] / max(acc['n_smp'], 1)
+    rinfl_pct = 100.0 * acc['n_rinfl'] / max(acc['n_smp'], 1)
+    avg_res = acc['sum_res'] / f
+    avg_af = acc['sum_af'] / f
+    c_res_str = f"{cfg.huber_residual_c:g}" if cfg.use_huber_residual else "off"
+    print(f"          └─▶ [burst-filt] {f} folds | res|·|avg {avg_res:.1f} → clip {clip_pct:.0f}%(c={c_res_str}) "
+          f"| R ×{avg_af:.2f}avg/{acc['max_af']:.1f}max ↑{rinfl_pct:.0f}%(c_R={cfg._huber_r_c_eff:g}) "
+          f"| worst {acc['worst_res']:+.1f}→{acc['worst_clip']:+.1f}")
+    sp['_burst_acc'] = None
 
 
 def build_layer_sigma_groups(info, device):
@@ -438,7 +458,7 @@ class Config:
     target_update_mode: str = 'soft'
     target_update_period: int = 200   # hard mode 시 호라이즌 업데이트 카운트 기준
     
-    activation_fn: str = 'relu' #tanh
+    activation_fn: str = 'silu' #tanh
     init_scheme: str = 'he' #xavier
 
     buffer_size: int = 50000
@@ -448,17 +468,17 @@ class Config:
     q_init: float = 1e-3
     q_end: float = 1e-3
 
-    r_init: float = 1.5
-    r_end: float = 1.5
+    r_init: float = 1.0
+    r_end: float = 1.0
 
     # [RHUKF robust] 두 가지 독립 Huber 로직 (각각 토글 + 임계 c):
     #   ① Huber R       : |innovation|>c면 측정노이즈 R 인플레(R_eff=R_base·max(|res|/c,1)) → 게인↓로 outlier 다운웨이트.
     #   ② Huber residual: 상태 보정에 들어가는 innovation을 [-c,c]로 클립(K@clip(res)) → 보정 크기 직접 제한.
 
     use_huber_r: bool = True
-    huber_r_c: float = 7
+    huber_r_c: float = 3
     use_huber_residual: bool = True
-    huber_residual_c: float = 10.0
+    huber_residual_c: float = 5.0
     _huber_r_c_eff: float = 5
 
     r_mode: str = 'fixed' # fixed / adaptive / innovation
@@ -493,7 +513,7 @@ class Config:
     fast: bool = False #로그 ON/OFF
 
     # 'filter'(RHUKF) | 'adam'(Adam baseline) | 'sgd'(SGD baseline, =adam+baseline_opt=sgd) | 'compare'(RHUKF vs baseline)
-    train_mode: str = 'adam'
+    train_mode: str = 'filter'
     use_adam_warmup: bool = False
     # [baseline 옵티마이저] gradient baseline(train_mode='adam' 경로)의 옵티마이저 선택.
     #   'adam' = Adam(m/√v 정규화 → 스텝 정규화) / 'sgd' = SGD(정규화 없음, momentum로 누적 조절)
@@ -518,9 +538,9 @@ class Config:
     use_burst: bool = False
     burst_target: str = 'td_error'        # 'reward'(보상 r→y) | 'td_error'(TD target/잔차 직접). TD target 주입은 td_error 권장.
 
-    burst_windows: List[List[int]] = field( default_factory=lambda: [[15, 20], [25, 30], [55, 60], [75, 80], [105,110]])
+    burst_windows: List[List[int]] = field( default_factory=lambda: [[15, 20], [35, 40], [55, 60], [75, 80], [105,110]])
     burst_prob: float = 0.1             # 주입 확률 (persistent: env step당 / transient: update 이벤트당)
-    burst_value: float = 10.0           # 가산 오차 크기 (scale_factor 적용 전 reward 단위)
+    burst_value: float = 3.0           # 가산 오차 크기 (scale_factor 적용 전 reward 단위)
     burst_sign: str = 'random'          # 'random'(±) | 'pos'(+only) | 'neg'(-only)
     burst_store_in_buffer: bool = False  # True=버퍼 영구 저장(persistent) / False=일시(transient). td_error면 무시.
     _burst_count: int = 0               # 런타임 주입 횟수 카운터 (내부용)
@@ -4765,10 +4785,10 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache, _log
     R_base, _r_raw = compute_r_base(P_zz_sigma, residual, current_r_std, cfg)
     R_diag_eff = R_base * adapt_factor
 
-    # [burst-filt] burst 주입 시 robust 기전(Huber clip + Huber R) 실제 동작 로그.
-    #   fast 조기반환 이전에 박아야 fast mode에서도 보임. 메인 필터(_log_burst=True)만.
+    # [burst-filt] burst 주입 시 robust 기전(Huber clip + Huber R) fold별 누적(에피소드 끝 1줄 flush).
+    #   fast 조기반환 이전에 박아야 fast mode에서도 집계됨. 메인 필터(_log_burst=True)만.
     if _log_burst and _tb is not None:
-        log_burst_filter_action(residual, _tb, adapt_factor, R_base, cfg, h_idx)
+        accumulate_burst_filter(sp, residual, _tb, adapt_factor, R_base, cfg)
 
     P_zz = P_zz_sigma + torch.diag(R_diag_eff)
     P_zz = 0.5 * (P_zz + P_zz.t())
@@ -6959,6 +6979,9 @@ def train_srrhuif():
             print(f"{prefix_tag} Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | {_qr_label}: {sp.get('current_q_std', cfg.q_init):.1e}/{_r_disp} | P_avg(pred→post): {avg_P_pred_ep:.4f}→{avg_P_ep:.4f} (Δ-{max(avg_P_pred_ep-avg_P_ep,0):.4f}, P0={eff_prior:.2f}) | K_Gain: {avg_k:.4f} "
                   f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] | {_learn_str}{_burst_tag} | Time: {time.time()-ep_start:.2f}s")
+
+            # ── [burst-filt] 이 에피소드 burst 흡수 1줄 요약 (burst 들어온 에피소드만) ──
+            flush_burst_filter_log(sp, cfg)
 
             # ── 호라이즌 진행에 따른 P 변화 (각 fold: 사후 P 대각의 max/min) — 항상 출력 ──
             if last_h_p_traj:
