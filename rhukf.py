@@ -530,7 +530,13 @@ class Config:
 
     # [Adam Huber] Adam loss robust-loss. adam_use_huber로 on/off, adam_huber_delta로 δ값 (단일 노브).
     adam_use_huber: bool = True        # True=Huber(δ=adam_huber_delta) / False=MSE
-    adam_huber_delta: float = 10.0       # Adam Huber δ (adam_use_huber=True일 때만 사용)
+    adam_huber_delta: float = 3.0       # Adam Huber δ (adam_use_huber=True일 때만 사용)
+    # [Adam robust] amsgrad는 항상 True(max-v 안정화 → step 폭주 억제). 옵티마이저 생성 시 직접 박음.
+    # [Adam grad clip] backward와 step 사이 clip_grad_value_(±값). 0=off. RHUKF Huber residual clip 대응(보정 크기 직접 제한).
+    adam_grad_clip: float = 10.0
+    # [Adam weight decay] On이면 decoupled decay 정석인 AdamW 사용, Off면 그냥 Adam(wd=0이라 AdamW와 수학적 동일).
+    use_adam_weight_decay: bool = False
+    adam_weight_decay: float = 0.01      # use_adam_weight_decay=True일 때만 적용되는 decoupled wd 값
 
     warmup_step : int = 0
     
@@ -940,6 +946,10 @@ class Config:
         if self.train_mode in ('adam', 'sgd'):
             _opt_tag = (f"SGD_lr{self.adam_lr:g}m{self.sgd_momentum:g}" if self.baseline_opt == 'sgd'
                         else f"ADAM_lr{self.adam_lr:g}")
+            if self.adam_grad_clip > 0:                       # grad clip 켜진 run 구분
+                _opt_tag += f"gc{self.adam_grad_clip:g}"
+            if self.use_adam_weight_decay:                    # weight decay(AdamW) 켜진 run 구분
+                _opt_tag += f"wd{self.adam_weight_decay:g}"
             _hub_tag = (f"_hub{self.adam_huber_delta:g}" if self.adam_use_huber else "_mse")
             self.param_str = (
                 f"{_opt_tag}{_hub_tag}_b{self.batch_size}_{net_tag}_s{self.network_seed}{burst_tag}"
@@ -1013,6 +1023,27 @@ def burst_mode_str(cfg) -> str:
 def burst_active_at(cfg, ep) -> bool:
     """현재 에피소드 ep가 burst 주입 구간(들) 안인지. burst_windows의 한 구간이라도 포함하면 True."""
     return any(s <= ep <= e for s, e in cfg.burst_windows)
+
+
+def build_grad_optimizer(params, cfg, allow_sgd=True):
+    """[baseline/warmup] gradient 옵티마이저 + 설명문자열 생성 (한 곳에서 일관 설정).
+      - amsgrad : 항상 True (max-v 안정화 → step 폭주 억제).
+      - weight decay : use_adam_weight_decay=True면 decoupled decay 정석인 AdamW 사용,
+                       False면 그냥 Adam(wd=0이라 AdamW와 수학적으로 동일) → 불필요한 AdamW 라벨 회피.
+      - SGD : baseline_opt='sgd'이고 allow_sgd일 때만(warmup은 항상 Adam 계열). amsgrad 무관, wd만 coupled L2로 반영.
+    grad clip은 옵티마이저가 아니라 step 직전 clip_grad_value_로 따로 적용(cfg.adam_grad_clip)."""
+    wd = cfg.adam_weight_decay if cfg.use_adam_weight_decay else 0.0
+    if allow_sgd and cfg.baseline_opt == 'sgd':
+        opt = torch.optim.SGD(params, lr=cfg.adam_lr, momentum=cfg.sgd_momentum, weight_decay=wd)
+        desc = (f"SGD(lr={cfg.adam_lr:g}, momentum={cfg.sgd_momentum:g}"
+                + (f", wd={wd:g}" if wd else "") + ")")
+    elif cfg.use_adam_weight_decay:
+        opt = torch.optim.AdamW(params, lr=cfg.adam_lr, amsgrad=True, weight_decay=wd)
+        desc = f"AdamW(lr={cfg.adam_lr:g}, amsgrad=True, wd={wd:g})"
+    else:
+        opt = torch.optim.Adam(params, lr=cfg.adam_lr, amsgrad=True)
+        desc = f"Adam(lr={cfg.adam_lr:g}, amsgrad=True)"
+    return opt, desc
 
 
 def save_checkpoint(path, theta, theta_target, info, normalizer, cfg, ep, metric,
@@ -1304,6 +1335,13 @@ parser.add_argument('--no_adam_warmup', dest='use_adam_warmup', action='store_fa
                     help="Adam warm-up 비활성 (기존 동작: 윈도우 채우는 동안 θ 변화 없음)")
 parser.add_argument('--adam_lr', type=float, default=cfg.adam_lr,
                     help="[v9+] Adam warm-up learning rate (default %(default)s)")
+parser.add_argument('--adam_grad_clip', type=float, default=cfg.adam_grad_clip,
+                    help="[Adam robust] step 직전 grad value clip(±값). 0=off. RHUKF residual clip 대응 (default %(default)s)")
+parser.add_argument('--use_adam_weight_decay', dest='use_adam_weight_decay', action='store_true',
+                    default=cfg.use_adam_weight_decay,
+                    help="[Adam] weight decay ON → decoupled decay(AdamW) 사용 (기본 OFF=그냥 Adam)")
+parser.add_argument('--adam_weight_decay', type=float, default=cfg.adam_weight_decay,
+                    help="[Adam] decoupled weight decay 값 (use_adam_weight_decay=True일 때만, default %(default)s)")
 parser.add_argument('--adam_tau', type=float, default=cfg.adam_tau,
                     help="공정 Adam-DDQN baseline soft target Polyak τ (default %(default)s)")
 parser.add_argument('--adam_lr_end', type=float, default=cfg.adam_lr_end,
@@ -1476,6 +1514,9 @@ cfg.adam_tau = args.adam_tau
 cfg.adam_update_interval = args.adam_update_interval
 cfg.baseline_opt = args.baseline_opt
 cfg.sgd_momentum = args.sgd_momentum
+cfg.adam_grad_clip = args.adam_grad_clip
+cfg.use_adam_weight_decay = args.use_adam_weight_decay
+cfg.adam_weight_decay = args.adam_weight_decay
 cfg.adam_use_huber = args.adam_use_huber
 cfg.diag_adam_internals = args.diag_adam_internals
 cfg.diag_burst_filter = args.diag_burst_filter
@@ -6377,10 +6418,11 @@ def train_srrhuif():
     # ──────────────────────────────────────────────────────────────────
     if cfg.use_adam_warmup:
         theta_param = nn.Parameter(theta.squeeze().clone().detach(), requires_grad=True)
-        adam_opt = torch.optim.Adam([theta_param], lr=cfg.adam_lr)
+        adam_opt, _wu_opt_desc = build_grad_optimizer([theta_param], cfg, allow_sgd=False)
         adam_steps_taken = 0
         _wu_loss = f"Huber(δ={cfg.adam_huber_delta:g})" if cfg.adam_use_huber else "MSE"
-        print(f"[Adam Warm-up] enabled (lr={cfg.adam_lr:g}, "
+        _wu_clip = f", clip±{cfg.adam_grad_clip:g}" if cfg.adam_grad_clip > 0 else ""
+        print(f"[Adam Warm-up] enabled ({_wu_opt_desc}{_wu_clip}, "
               f"until len(batch_hist)=={cfg.N_horizon}, loss={_wu_loss})")
         if cfg.measurement_mode == 'pure_reward':
             print(f"[Adam Warm-up] NOTE: cfg.measurement_mode='pure_reward'이지만 "
@@ -6614,6 +6656,8 @@ def train_srrhuif():
                     adam_opt.zero_grad(set_to_none=True)
                     loss_adam = compute_adam_td_loss(theta_param, theta_target, batch, sp, cfg)
                     loss_adam.backward()
+                    if cfg.adam_grad_clip > 0:  # [grad clip] RHUKF residual clip 대응 (값 클리핑)
+                        torch.nn.utils.clip_grad_value_([theta_param], cfg.adam_grad_clip)
                     adam_opt.step()
                     with torch.no_grad():
                         theta.data.copy_(theta_param.data.view(-1, 1))
@@ -7237,14 +7281,11 @@ def train_adam():
     theta_target = theta.clone()
 
     theta_param = nn.Parameter(theta.squeeze().clone().detach(), requires_grad=True)
-    # [baseline 옵티마이저] Adam(정규화) vs SGD(정규화 없음, momentum로 누적 조절)
-    if cfg.baseline_opt == 'sgd':
-        adam_opt = torch.optim.SGD([theta_param], lr=cfg.adam_lr, momentum=cfg.sgd_momentum)
-        _opt_desc = f"SGD(lr={cfg.adam_lr:g}, momentum={cfg.sgd_momentum:g})"
-    else:
-        adam_opt = torch.optim.Adam([theta_param], lr=cfg.adam_lr)
-        _opt_desc = f"Adam(lr={cfg.adam_lr:g})"
-    print(f"[baseline] optimizer = {_opt_desc} | loss = "
+    # [baseline 옵티마이저] Adam/AdamW(정규화) vs SGD(정규화 없음, momentum로 누적 조절)
+    #   amsgrad=True 고정 + wd On이면 AdamW, grad clip은 step 직전 적용(아래).
+    adam_opt, _opt_desc = build_grad_optimizer([theta_param], cfg, allow_sgd=True)
+    _clip_desc = f" | grad clip ±{cfg.adam_grad_clip:g}" if cfg.adam_grad_clip > 0 else ""
+    print(f"[baseline] optimizer = {_opt_desc}{_clip_desc} | loss = "
           + (f"Huber(δ={cfg.adam_huber_delta:g})" if cfg.adam_use_huber else "MSE"))
 
     analyze_initial_network(theta, info, env, cfg, normalizer)
@@ -7369,8 +7410,10 @@ def train_adam():
                 else:
                     loss = compute_adam_td_loss(theta_param, theta_target, batch, sp, cfg)
                 loss.backward()
+                if cfg.adam_grad_clip > 0:  # [grad clip] RHUKF residual clip 대응 (값 클리핑); step 전 적용
+                    torch.nn.utils.clip_grad_value_([theta_param], cfg.adam_grad_clip)
                 if _diag_adam:
-                    _gn = theta_param.grad.norm().item()             # ‖grad‖ (Huber면 burst에도 bound)
+                    _gn = theta_param.grad.norm().item()             # ‖grad‖ (Huber+clip 적용된 effective gradient)
                     _tb_before = theta_param.detach().clone()        # step 전 θ
                 adam_opt.step()
                 with torch.no_grad():
