@@ -216,6 +216,46 @@ def huber_clip_residual(residual, cfg):
     return residual
 
 
+def log_burst_filter_action(residual, _tb, adapt_factor, R_base, cfg, h_idx, tag='rhukf-fv-es'):
+    """[burst-filt] burst 주입(_td_burst) 시 두 robust 기전이 '그 배치 잔차'에 실제로
+    어떻게 걸렸는지 1줄로 보여준다 — fast mode에서도 호출됨(진단 조기반환 이전에 박음).
+      ① Huber residual clip : K@res에 들어가는 innovation을 [-c,c]로 클립 → "res 몇→몇"
+      ② Huber R             : R_eff = R_base·max(|res|/c_R,1) → "R_base 몇→×factor→R_eff"
+    인자:
+      residual    : post-burst innovation [B,1] (= clean 잔차 + _td_burst)
+      _tb         : 이 배치에 주입된 ±burst_value 텐서 [B]
+      adapt_factor: Huber R 인플레 계수 [B] (=max(|res|/c_R,1), 또는 IS-R 경로면 w^-β)
+      R_base      : 이 스텝 base 측정분산 (scalar; 적응형이면 동적값)
+    배치 전체가 burst라 대표로 |post-burst 잔차|가 가장 큰 샘플 1개를 풀어 보여주고,
+    배치 집계(클립된 수 / R 인플레된 수 / 평균 인플레)를 덧붙인다."""
+    if not (cfg.diag_burst_filter and _tb is not None):
+        return
+    with torch.no_grad():
+        res = residual.reshape(-1)
+        tb = _tb.reshape(-1).to(res.dtype)
+        res_clean = res - tb                       # 주입 전(클린) 잔차
+        use_clip = cfg.use_huber_residual
+        c_res = cfg.huber_residual_c if use_clip else float('inf')
+        res_clip = torch.clamp(res, -c_res, c_res) if use_clip else res
+        af = adapt_factor.reshape(-1)
+        c_R = cfg._huber_r_c_eff
+        i = int(torch.argmax(res.abs()).item())    # 가장 극단적인 샘플
+        n = res.numel()
+        n_clipped = int((res.abs() > c_res).sum().item()) if use_clip else 0
+        n_rinfl = int((af > 1.0).sum().item())
+        rb = float(R_base)
+        # 스칼라 추출 (.item()은 한 번에)
+        rc, tbi, rpost, rclip, afi = (res_clean[i].item(), tb[i].item(),
+                                      res[i].item(), res_clip[i].item(), af[i].item())
+        mean_af = af.mean().item()
+    c_res_str = f"{c_res:g}" if use_clip else "off"
+    print(
+        f"        └─▶ [burst-filt {tag} h{h_idx}] "
+        f"worst#{i}: res {rc:+.3f}{tbi:+.3f}(δ)={rpost:+.3f} ─clip(c={c_res_str})→ {rclip:+.3f} | "
+        f"R {rb:.3f} ─×{afi:.2f}(c_R={c_R:g})→ {rb*afi:.3f} | "
+        f"batch: clipped {n_clipped}/{n}, R↑ {n_rinfl}/{n}, mean×{mean_af:.2f}")
+
+
 def build_layer_sigma_groups(info, device):
     """[진단] info['layers'] → [(label, sigma_index_tensor)].
     UT sigma point σ=1+j / σ=1+n_x+j 는 param j의 ± 섭동 → 층별 분할용 매핑.
@@ -398,7 +438,7 @@ class Config:
     target_update_mode: str = 'soft'
     target_update_period: int = 200   # hard mode 시 호라이즌 업데이트 카운트 기준
     
-    activation_fn: str = 'silu' #tanh
+    activation_fn: str = 'relu' #tanh
     init_scheme: str = 'he' #xavier
 
     buffer_size: int = 50000
@@ -450,7 +490,7 @@ class Config:
     use_n_step: bool = True
     n_step_size: int = 3
 
-    fast: bool = True #로그 ON/OFF
+    fast: bool = False #로그 ON/OFF
 
     # 'filter'(RHUKF) | 'adam'(Adam baseline) | 'sgd'(SGD baseline, =adam+baseline_opt=sgd) | 'compare'(RHUKF vs baseline)
     train_mode: str = 'adam'
@@ -461,16 +501,16 @@ class Config:
     baseline_opt: str = 'adam'
     sgd_momentum: float = 0.0          # SGD momentum (0=순수 SGD/누적 없음, 0.9=모멘텀 누적). baseline_opt='sgd'일 때만.
     _baseline_label: str = 'ADAM'      # 런타임 파생: 'ADAM' 또는 'SGD'
-    adam_lr: float = 3e-4
-    adam_tau: float = 0.005            # Adam soft target Polyak 계수 (표준 DDQN)
-    adam_update_interval: int = 1      # Adam은 매 env 스텝 업데이트
-    adam_force_fp32: bool = True       # Adam baseline은 TF32 끄고 FP32 (공정성/재현성)
-    adam_lr_end: float = 1e-3          # lr anneal 종료값 (adam_lr → adam_lr_end, geometric 감쇠)
-    adam_lr_anneal: bool = False        # 에피소드 진행에 따라 Adam lr 감쇠
+    adam_lr: float = 5e-4
+    adam_tau: float = 0.005
+    adam_update_interval: int = 1 
+    adam_force_fp32: bool = True
+    adam_lr_end: float = 1e-4      
+    adam_lr_anneal: bool = False
 
     # [Adam Huber] Adam loss robust-loss. adam_use_huber로 on/off, adam_huber_delta로 δ값 (단일 노브).
     adam_use_huber: bool = True        # True=Huber(δ=adam_huber_delta) / False=MSE
-    adam_huber_delta: float = 5.0       # Adam Huber δ (adam_use_huber=True일 때만 사용)
+    adam_huber_delta: float = 10.0       # Adam Huber δ (adam_use_huber=True일 때만 사용)
 
     warmup_step : int = 0
     
@@ -478,7 +518,7 @@ class Config:
     use_burst: bool = False
     burst_target: str = 'td_error'        # 'reward'(보상 r→y) | 'td_error'(TD target/잔차 직접). TD target 주입은 td_error 권장.
 
-    burst_windows: List[List[int]] = field( default_factory=lambda: [[65, 70], [85, 90], [105,110]])
+    burst_windows: List[List[int]] = field( default_factory=lambda: [[15, 20], [25, 30], [55, 60], [75, 80], [105,110]])
     burst_prob: float = 0.1             # 주입 확률 (persistent: env step당 / transient: update 이벤트당)
     burst_value: float = 10.0           # 가산 오차 크기 (scale_factor 적용 전 reward 단위)
     burst_sign: str = 'random'          # 'random'(±) | 'pos'(+only) | 'neg'(-only)
@@ -551,6 +591,10 @@ class Config:
     diag_layer_r: bool = True
     # [adam-int] train_adam에서 burst 흡수 내부량(Huber clip%/‖grad‖/‖Δθ‖/loss)을 burst·clean 버킷으로 로그.
     diag_adam_internals: bool = True
+    # [burst-filt] RHUKF step에서 burst 주입 시 robust 기전이 그 배치 잔차에 실제로 어떻게 작동했는지
+    #   (Huber residual clip: res 몇→몇 / Huber R: R_base 몇→×factor→R_eff) 1줄 로그.
+    #   fast여도 유지(diag_adam_internals와 동일한 분석-전용 독립 플래그). 끄려면 --no_burst_filter.
+    diag_burst_filter: bool = True
 
     # [v9+] Activation health: hidden 레이어 포화/죽은 뉴런 모니터
     diag_act_health: bool = True
@@ -1244,8 +1288,11 @@ parser.add_argument('--adam_tau', type=float, default=cfg.adam_tau,
                     help="공정 Adam-DDQN baseline soft target Polyak τ (default %(default)s)")
 parser.add_argument('--adam_lr_end', type=float, default=cfg.adam_lr_end,
                     help="Adam lr anneal 종료값 (default %(default)s; adam_lr→adam_lr_end geometric)")
+parser.add_argument('--adam_lr_anneal', dest='adam_lr_anneal', action='store_true',
+                    default=cfg.adam_lr_anneal,
+                    help="Adam lr 스케줄 ON: adam_lr→adam_lr_end geometric 감쇠 (후반 churn↓, 붕괴 완화)")
 parser.add_argument('--no_adam_lr_anneal', dest='adam_lr_anneal', action='store_false',
-                    default=cfg.adam_lr_anneal, help="Adam lr 스케줄 비활성 (고정 lr)")
+                    help="Adam lr 스케줄 비활성 (고정 lr)")
 parser.add_argument('--adam_update_interval', type=int, default=cfg.adam_update_interval,
                     help="Adam baseline env 스텝당 업데이트 주기 (default %(default)s)")
 parser.add_argument('--no_adam_fp32', dest='adam_force_fp32', action='store_false', default=cfg.adam_force_fp32,
@@ -1259,6 +1306,9 @@ parser.add_argument('--adam_huber_delta', type=float, default=cfg.adam_huber_del
 parser.add_argument('--no_adam_internals', dest='diag_adam_internals', action='store_false',
                     default=cfg.diag_adam_internals,
                     help="[adam-int] Adam burst 흡수 내부량(clip%/grad/Δθ) 진단 로그 끄기")
+parser.add_argument('--no_burst_filter', dest='diag_burst_filter', action='store_false',
+                    default=cfg.diag_burst_filter,
+                    help="[burst-filt] RHUKF burst-시 Huber clip/R 동작(res 몇→몇, R 몇→몇) 로그 끄기")
 # ── [burst robustness] reward(measurement) burst 오차 주입 ──
 parser.add_argument('--use_burst', dest='use_burst', action='store_true', default=cfg.use_burst,
                     help="[robustness] 특정 에피소드 구간에 reward(measurement) burst 오차 주입")
@@ -1408,6 +1458,7 @@ cfg.baseline_opt = args.baseline_opt
 cfg.sgd_momentum = args.sgd_momentum
 cfg.adam_use_huber = args.adam_use_huber
 cfg.diag_adam_internals = args.diag_adam_internals
+cfg.diag_burst_filter = args.diag_burst_filter
 cfg.adam_huber_delta = args.adam_huber_delta
 cfg.adam_force_fp32 = args.adam_force_fp32
 cfg.adam_lr_end = args.adam_lr_end
@@ -4562,9 +4613,11 @@ def srrhuif_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
 #  Final:  θ_active = θ_anchor + Δμ_new
 # =========================================================================
 @torch.no_grad()
-def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
+def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache, _log_burst=False):
     """
     Error-state RHUKF (Covariance form) — one horizon h-step.
+    _log_burst: True면 burst 주입 시 robust 기전 동작을 1줄 로그(메인 필터에서만 True;
+                twin은 같은 batch라 중복 로그 방지 위해 기본 False).
     
     Args:
         filter_state: None at h=0, else dict {'mu_delta', 'P_delta'} from h-1
@@ -4711,6 +4764,12 @@ def rhukf_step_fv_error(filter_state, ctx, batch, h_idx, sp, cfg, fv_cache):
     # [처방A] 적응형 R이면 base = max(R_min, λ·Tr(P_zz_sigma)/n_d), 아니면 current_r_std
     R_base, _r_raw = compute_r_base(P_zz_sigma, residual, current_r_std, cfg)
     R_diag_eff = R_base * adapt_factor
+
+    # [burst-filt] burst 주입 시 robust 기전(Huber clip + Huber R) 실제 동작 로그.
+    #   fast 조기반환 이전에 박아야 fast mode에서도 보임. 메인 필터(_log_burst=True)만.
+    if _log_burst and _tb is not None:
+        log_burst_filter_action(residual, _tb, adapt_factor, R_base, cfg, h_idx)
+
     P_zz = P_zz_sigma + torch.diag(R_diag_eff)
     P_zz = 0.5 * (P_zz + P_zz.t())
 
@@ -6631,7 +6690,7 @@ def train_srrhuif():
                         if cfg.state_form == 'error':
                             if is_rhukf and is_fv:
                                 theta, filter_state_es, l_val, t_var, t_k_gain, dbg = rhukf_step_fv_error(
-                                    filter_state_es, horizon_ctx, batch_hist[h], h, sp, cfg, f_cache)
+                                    filter_state_es, horizon_ctx, batch_hist[h], h, sp, cfg, f_cache, _log_burst=True)
                             elif is_rhukf:  # node/layer + cov + error
                                 theta, filter_state_es, l_val, t_var, t_k_gain, dbg = rhukf_step_error(
                                     filter_state_es, horizon_ctx, batch_hist[h], h, sp, cfg, f_cache)
@@ -7412,6 +7471,16 @@ def train_adam():
                   f"| Loss: {avg_l:.4f} | lr: {cur_lr:.1e} "
                   f"| Q[{', '.join(f'{q:.2f}' for q in avg_q)}] "
                   f"| Updates: {param_update_count}{_burst_tag} | Time: {time.time()-ep_start:.2f}s")
+
+            # [collapse-watch] 후반 reward 붕괴 원인 진단(콘솔) — DQN deadly-triad 시그니처.
+            #   |Q|max↑=과대추정, eff_rank↓=표현붕괴, dead%↑=가소성 상실, θ-drift/Δθ=churn. (fast면 진단 off라 생략)
+            if not cfg.fast:
+                _qmax = max((abs(q) for q in avg_q), default=0.0)
+                _dead = (act_health['__total__']['dead_ratio'] if act_health else 0.0)
+                _ref = (cfg.shared_layers[-1] if cfg.shared_layers else '?')
+                _er = f"{eff_rank_val:.1f}/{_ref}" if (eff_rank_val and eff_rank_val > 0) else "—"
+                print(f"          └─▶ [collapse-watch] |Q|max={_qmax:.1f}(과대추정↑) | eff_rank={_er}(↓붕괴) "
+                      f"| dead={100*_dead:.0f}% | θ-drift={target_drift:.3f} | Δθ={ep_delta_norm:.3f}")
 
             # [adam-int] burst·clean 업데이트 내부량 대비 — burst인데 ‖grad‖/‖Δθ‖가 bound면 "흡수"의 증거.
             if cfg.diag_adam_internals and (ep_adam_burst['loss'] or ep_adam_clean['loss']):
