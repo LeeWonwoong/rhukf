@@ -571,6 +571,17 @@ class Config:
     burst_store_in_buffer: bool = False  # True=버퍼 영구 저장(persistent) / False=일시(transient). td_error면 무시.
     _burst_count: int = 0               # 런타임 주입 횟수 카운터 (내부용)
 
+    # ── [obs noise / 약한 POMDP화] 관측(state)에 노이즈를 주입해 부분관측화
+    #   env가 내보낸 obs를 에이전트가 받기 직전에 오염 → env 내부 true state는 불변, 관측만 noisy.
+    #   행동 선택·버퍼 저장 모두 오염된 obs를 사용한다(일관된 부분관측). burst(타깃/보상 오염)와
+    #   독립적인 robustness 축이므로 둘을 함께/따로 켜서 강건성을 비교할 수 있다.
+    use_obs_noise: bool = False
+    obs_noise_std: float = 0.1           # 노이즈 강도 (gaussian σ / uniform 반폭). 0이면 off와 동일.
+    obs_noise_type: str = 'gaussian'     # 'gaussian'(가산 정규 N(0,σ)) | 'uniform'(±σ 균등)
+    obs_noise_relative: bool = False     # True=per-dim |obs|에 비례(곱셈성, 스케일 다른 차원 보정) / False=절대 가산
+    obs_noise_seed: Optional[int] = None # None이면 전역 np.random 사용. 지정 시 노이즈 전용 RNG로 burst와 독립 재현.
+    _obs_noise_rng = None                # 런타임 노이즈 전용 Generator (내부용; obs_noise_seed 지정 시 생성)
+
     # ── [checkpoint & early stop] ──
     save_best_ckpt: bool = False
     best_metric_window: int = 20        # best 판정 이동평균 창
@@ -1045,6 +1056,30 @@ def burst_active_at(cfg, ep) -> bool:
     return any(s <= ep <= e for s, e in cfg.burst_windows)
 
 
+def add_obs_noise(obs, cfg):
+    """[약한 POMDP] env 관측에 노이즈를 주입. env 내부 true state는 불변, 에이전트가 보는 obs만 오염.
+    use_obs_noise=False 또는 obs_noise_std<=0이면 원본 obs를 그대로 반환(무비용 패스스루)."""
+    if not cfg.use_obs_noise or cfg.obs_noise_std <= 0.0:
+        return obs
+    # obs_noise_seed 지정 시 전용 RNG로 burst/env RNG 스트림과 독립 (재현·공정 비교용)
+    if cfg.obs_noise_seed is not None:
+        if cfg._obs_noise_rng is None:
+            cfg._obs_noise_rng = np.random.default_rng(cfg.obs_noise_seed)
+        rng = cfg._obs_noise_rng
+        draw_u = lambda shp: rng.uniform(-cfg.obs_noise_std, cfg.obs_noise_std, size=shp)
+        draw_n = lambda shp: rng.standard_normal(shp) * cfg.obs_noise_std
+    else:
+        draw_u = lambda shp: np.random.uniform(-cfg.obs_noise_std, cfg.obs_noise_std, size=shp)
+        draw_n = lambda shp: np.random.randn(*shp) * cfg.obs_noise_std
+
+    obs = np.asarray(obs, dtype=np.float32)
+    noise = (draw_u(obs.shape) if cfg.obs_noise_type == 'uniform' else draw_n(obs.shape))
+    noise = noise.astype(np.float32)
+    if cfg.obs_noise_relative:           # per-dim |obs| 비례(곱셈성): 차원별 스케일 차이 보정
+        noise = noise * np.abs(obs)
+    return obs + noise
+
+
 def build_grad_optimizer(params, cfg, allow_sgd=True):
     """[baseline/warmup] gradient 옵티마이저 + 설명문자열 생성 (한 곳에서 일관 설정).
       - amsgrad : 항상 True (max-v 안정화 → step 폭주 억제).
@@ -1408,6 +1443,20 @@ parser.add_argument('--burst_store_in_buffer', dest='burst_store_in_buffer', act
                     help="O: 오염된 r을 버퍼에 영구 저장 (지속적 outlier, 반복 샘플링)")
 parser.add_argument('--burst_transient', dest='burst_store_in_buffer', action='store_false',
                     help="X: 버퍼는 클린, 필터 업데이트의 measurement만 일시 오염 (transient glitch)")
+# ── [obs noise / 약한 POMDP화] ──
+parser.add_argument('--use_obs_noise', dest='use_obs_noise', action='store_true', default=cfg.use_obs_noise,
+                    help="[robustness] 관측(state)에 노이즈 주입 → 약한 POMDP화 (env true state 불변)")
+parser.add_argument('--no_obs_noise', dest='use_obs_noise', action='store_false',
+                    help="obs noise 비활성")
+parser.add_argument('--obs_noise_std', type=float, default=cfg.obs_noise_std,
+                    help="노이즈 강도: gaussian σ / uniform 반폭 (default %(default)s)")
+parser.add_argument('--obs_noise_type', type=str, default=cfg.obs_noise_type, choices=['gaussian', 'uniform'],
+                    help="노이즈 분포: gaussian(N(0,σ)) / uniform(±σ) (default %(default)s)")
+parser.add_argument('--obs_noise_relative', dest='obs_noise_relative', action='store_true',
+                    default=cfg.obs_noise_relative,
+                    help="per-dim |obs| 비례(곱셈성) — 차원별 스케일 차이 보정")
+parser.add_argument('--obs_noise_seed', type=int, default=cfg.obs_noise_seed,
+                    help="노이즈 전용 RNG 시드 (지정 시 burst/env RNG와 독립 재현, 미지정 시 전역 np.random)")
 # ── [checkpoint & early stop] ──
 parser.add_argument('--no_best_ckpt', dest='save_best_ckpt', action='store_false', default=cfg.save_best_ckpt,
                     help="best checkpoint 저장 비활성 (기본은 항상 저장)")
@@ -1558,6 +1607,13 @@ if args.burst_windows:
         [int(_t.split('-', 1)[0]), int(_t.split('-', 1)[1])] if '-' in _t else [int(_t), int(_t)]
         for _t in args.burst_windows
     ]
+
+# [obs noise / 약한 POMDP화]
+cfg.use_obs_noise = args.use_obs_noise
+cfg.obs_noise_std = args.obs_noise_std
+cfg.obs_noise_type = args.obs_noise_type
+cfg.obs_noise_relative = args.obs_noise_relative
+cfg.obs_noise_seed = args.obs_noise_seed
 
 # [checkpoint & early stop]
 cfg.save_best_ckpt = args.save_best_ckpt
@@ -6543,15 +6599,22 @@ def train_srrhuif():
     last_h_layer_gain = []  # [probe] per-h × per-layer mean_gain dict 리스트
     last_h_layer_spread, last_h_layer_amp, last_h_layer_spos = [], [], []  # [sigma-spread] per-h × per-layer
 
+    # [obs noise] 노이즈 전용 RNG 리셋(재현) + 초기 obs 오염 + 배너
+    cfg._obs_noise_rng = None
     s, _ = env.reset(seed=env_seed)
+    s = add_obs_noise(s, cfg)
 
     # [burst robustness] 카운터 리셋 + 설정 배너
     cfg._burst_count = 0
     if cfg.use_burst:
         _bmode = f"target={cfg.burst_target}, {burst_mode_str(cfg)}"
-        _bwin = "ep" + ",".join(f"{s}-{e}" for s, e in cfg.burst_windows)
+        _bwin = "ep" + ",".join(f"{s_}-{e_}" for s_, e_ in cfg.burst_windows)
         print(f"[burst] ON | {_bwin} "
               f"prob={cfg.burst_prob:g} value=±{cfg.burst_value:g}({cfg.burst_sign}) | {_bmode}")
+    if cfg.use_obs_noise and cfg.obs_noise_std > 0.0:
+        _rel = "rel" if cfg.obs_noise_relative else "abs"
+        _rsd = f" seed={cfg.obs_noise_seed}" if cfg.obs_noise_seed is not None else ""
+        print(f"[obs_noise] ON(약한 POMDP) | {cfg.obs_noise_type} σ={cfg.obs_noise_std:g} ({_rel}){_rsd}")
 
     # [checkpoint & early stop] best는 환경 무관 항상, early stop은 env solved 기준(compare면 비활성)
     best_metric, best_ep, early_stopped, frozen = -float('inf'), -1, False, False
@@ -6564,6 +6627,7 @@ def train_srrhuif():
 
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=env_seed + ep)
+        s = add_obs_noise(s, cfg)  # [약한 POMDP] 관측 오염 (env true state 불변)
         buffer.set_current_episode(ep)
         # [soft-Q] τ annealing (ε처럼 학습 진행에 따라 감쇠)
         if cfg.use_soft_q:
@@ -6640,6 +6704,7 @@ def train_srrhuif():
             else:
                 a = int(q_vals.argmax().item())
             ns, r, done, trunc, _ = env.step(a)
+            ns = add_obs_noise(ns, cfg)  # [약한 POMDP] 다음 관측 오염 (행동 선택·버퍼 저장 모두 noisy obs)
             # [burst persistent] reward 타깃 + 버퍼 저장: 오염된 r을 버퍼에 영구 저장 (지속 outlier)
             r_store = r
             if (cfg.use_burst and burst_is_persistent(cfg)
@@ -7346,6 +7411,7 @@ def train_adam():
 
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=env_seed + ep)
+        s = add_obs_noise(s, cfg)  # [약한 POMDP] 관측 오염 (env true state 불변)
         buffer.set_current_episode(ep)
         # [soft-Q] τ annealing (ε처럼 학습 진행에 따라 감쇠)
         if cfg.use_soft_q:
@@ -7397,6 +7463,7 @@ def train_adam():
             else:
                 a = int(q_vals.argmax().item())
             ns, r, done, trunc, _ = env.step(a)
+            ns = add_obs_noise(ns, cfg)  # [약한 POMDP] 다음 관측 오염 (행동 선택·버퍼 저장 모두 noisy obs)
             # [burst persistent] reward 타깃 + 버퍼 저장: 오염된 r을 버퍼에 영구 저장 (지속 outlier)
             r_store = r
             if (cfg.use_burst and burst_is_persistent(cfg)
