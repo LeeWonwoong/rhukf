@@ -118,11 +118,16 @@ if torch.cuda.is_available():
 print("=" * 70)
 
 # =========================================================================
-# TF32 분리: NN forward만 TF32 matmul, 필터 행렬연산은 FP32
+# TF32 정책 (전역 1회 설정 — torch.compile 친화)
 #   - TF32는 Ampere+ (compute capability ≥ 8.0) GPU의 float32 matmul/bmm에만 적용.
 #   - torch.linalg 분해(cholesky/qr/solve_triangular)는 이 플래그와 무관하게 FP32
-#     → 필터의 분해는 항상 안전. 분리 대상은 matmul/bmm 정밀도뿐.
-#   - 전역 기본은 FP32(allow_tf32=False). forward 함수만 데코레이터로 호출 동안 TF32 on.
+#     → 필터의 분해는 항상 안전.
+#   - 기본은 FP32(allow_tf32=False). cfg.use_tf32_forward가 켜지고 GPU가 지원하면
+#     apply_tf32_config()에서 전역으로 단 한 번 TF32를 켠다(맨 위, 모델/compile 전).
+#   - per-call 데코레이터로 backend를 토글하지 않는다 → compile 영역에 graph break 없음.
+#   - 주의: 전역 설정이므로 forward뿐 아니라 필터의 matmul/bmm도 TF32를 쓰게 된다.
+#     수치가 민감한 필터 연산을 FP32로 강제하려면 해당 연산만 double 캐스팅하거나
+#     torch.backends.cuda.matmul.fp32_precision 컨텍스트로 따로 감싸야 한다.
 # =========================================================================
 TF32_FORWARD_ENABLED = False  # apply_tf32_config()에서 cfg + 하드웨어 보고 확정
 
@@ -130,27 +135,42 @@ def _tf32_supported() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
 
 def apply_tf32_config(cfg):
-    """전역 matmul을 FP32로 고정하고, GPU 지원 + cfg.use_tf32_forward일 때만 forward TF32 활성.
+    """전역 TF32 정책을 단 한 번 적용한다.
+    GPU 지원 + cfg.use_tf32_forward일 때만 전역 allow_tf32=True, 그 외엔 FP32 고정.
     Returns (enabled: bool, supported: bool)."""
     global TF32_FORWARD_ENABLED
     supported = _tf32_supported()
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
     TF32_FORWARD_ENABLED = bool(getattr(cfg, 'use_tf32_forward', True) and supported)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = TF32_FORWARD_ENABLED
+        torch.backends.cudnn.allow_tf32 = TF32_FORWARD_ENABLED
     return TF32_FORWARD_ENABLED, supported
 
 def tf32_forward(fn):
-    """NN forward 함수 데코레이터: 호출 동안만 TF32 matmul 허용(활성 시), 종료 시 원복.
-    비활성/미지원이면 완전 no-op(오버헤드 없음)이라 항상 붙여둬도 안전."""
+    """[deprecated] 과거 per-call TF32 토글 데코레이터.
+    TF32는 이제 apply_tf32_config()에서 전역으로 한 번만 설정하므로 이 데코레이터는
+    no-op passthrough다. compile 그래프를 깨지 않도록 forward 함수에서 제거되었다.
+    하위 호환을 위해 정의만 남겨둔다(붙어 있어도 무해)."""
+    return fn
+
+def fp32_matmul(fn):
+    """필터의 수치 민감 matmul/bmm(공분산 Gram·P_xz·혁신 등)을 FP32로 강제하는 데코레이터.
+
+    전역 TF32가 켜져 있어도(use_tf32_forward) 이 함수 실행 동안만 allow_tf32=False로 내렸다가
+    종료 시 원복한다 → 필터 정밀도는 FP32 보존, NN forward(compiled)는 전역 TF32 유지.
+
+    [중요] eager 함수에만 붙일 것. torch.compile 대상(forward_*) 안에서 backend를 토글하면
+    graph break가 난다. 또한 종료 시 반드시 원복하므로, 다음 forward_* 호출 시점엔 항상
+    allow_tf32=True가 보장되어 dynamo recompile 가드가 트리거되지 않는다.
+    전역이 이미 FP32(TF32 off)면 완전 no-op."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if not TF32_FORWARD_ENABLED:
             return fn(*args, **kwargs)
         prev_mm = torch.backends.cuda.matmul.allow_tf32
         prev_cudnn = torch.backends.cudnn.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
         try:
             return fn(*args, **kwargs)
         finally:
@@ -1561,10 +1581,11 @@ if args.q_layers is not None:
     cfg.q_layers = args.q_layers
 cfg.__post_init__()
 
-# ── TF32 정책 적용 (전역 FP32 고정 + GPU 지원 시 forward만 TF32) ──
+# ── TF32 정책 적용 (전역 1회: 기본 FP32, use_tf32_forward+지원 시에만 전역 TF32 on) ──
 _tf32_on, _tf32_sup = apply_tf32_config(cfg)
-print(f"[TF32] forward TF32 = {'ON' if _tf32_on else 'off'} "
-      f"(요청={cfg.use_tf32_forward}, GPU 지원={'yes' if _tf32_sup else 'no'}) | 행렬연산은 FP32 유지")
+print(f"[TF32] global TF32 = {'ON' if _tf32_on else 'off (FP32)'} "
+      f"(요청={cfg.use_tf32_forward}, GPU 지원={'yes' if _tf32_sup else 'no'}) "
+      f"| NN forward=TF32, 필터 covariance=FP32(@fp32_matmul) | compile graph break 없음")
 
 # =========================================================================
 # 2. Network Info & Unified Cache
@@ -1755,7 +1776,6 @@ def _get_act_fn(name: str):
         raise ValueError(f"Unknown activation_fn: {name}")
 
 
-@tf32_forward
 def forward_single(theta, info, x):
     theta = theta.to(DTYPE_FWD)
     if theta.dim() == 2: theta = theta.squeeze()
@@ -1811,7 +1831,6 @@ def forward_single(theta, info, x):
     else:
         return a.to(DTYPE)
 
-@tf32_forward
 def forward_single_with_shared(theta, info, x):
     theta = theta.to(DTYPE_FWD)
     if theta.dim() == 2: theta = theta.squeeze()
@@ -1870,7 +1889,6 @@ def forward_single_with_shared(theta, info, x):
         Q = a.to(DTYPE)
     return Q, shared_out.to(DTYPE)
 
-@tf32_forward
 def forward_bmm(thetas, info, x):
     thetas = thetas.to(DTYPE_FWD); x = x.to(DTYPE_FWD)
     num_sigma = thetas.shape[0]
@@ -2111,6 +2129,7 @@ class TensorReplayBuffer:
 # =========================================================================
 # 4. Math Utilities (Hybrid Batch QR & Triangular Solvers)
 # =========================================================================
+@fp32_matmul
 def tria_operation_batch(A):
     """
     [ND/LD 맞춤형 하이브리드 분해 엔진]
@@ -2180,6 +2199,7 @@ def compute_pseudo_cond_from_S(S_batch):
         return -1.0, -1.0, -1.0, -1.0
 
 @torch.no_grad()
+@fp32_matmul
 def compute_full_cond_from_S(S_batch):
     try:
         SST = torch.bmm(S_batch, S_batch.transpose(-2, -1))
@@ -2605,6 +2625,7 @@ def compute_sigma_spread(unified_sigma, info, x, eps=1e-6):
 
 
 @torch.no_grad()
+@fp32_matmul
 def compute_ut_consistency(Z_sigma_T, z_hat, residual, Wc, R_diag):
     """[A: NIS] [B: 선형화편향] — UT 추정의 통계적 일관성/비선형 편향 진단 (FV 측정공간).
 
@@ -2949,6 +2970,7 @@ def compute_ref_q_values(theta, info, normalizer, device):
 # =========================================================================
 # 6. SRRHUIF Core Functions
 # =========================================================================
+@fp32_matmul
 def _time_update_core(theta_3d, P_sqrt_prev, S_Q_cached, eye_batch, gamma_val):
     combined = torch.cat([P_sqrt_prev, S_Q_cached], dim=2)
     P_sqrt_pred = tria_operation_batch(combined)
@@ -2967,8 +2989,9 @@ def _time_update_core(theta_3d, P_sqrt_prev, S_Q_cached, eye_batch, gamma_val):
     
     return S_pred, None, y_pred, X_sigma_all, scaled_P
 
+@fp32_matmul
 def _compute_ht_core(Z_sigma_T_fwd, Wm_col_fwd, Wc_fwd, zero_col_fwd,
-                         scaled_P_fwd, z_measured_exp, S_pred): 
+                         scaled_P_fwd, z_measured_exp, S_pred):
     Z_sigma_T_fwd = Z_sigma_T_fwd.to(DTYPE_FWD)
     Wm_col_fwd = Wm_col_fwd.to(DTYPE_FWD)
     
@@ -2990,8 +3013,9 @@ def _compute_ht_core(Z_sigma_T_fwd, Wm_col_fwd, Wc_fwd, zero_col_fwd,
     
     return HT_all, residual_all, z_hat, ht_norm, resid_norm
 
-def _meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all, 
-                         r_inv_sqrt, r_inv, eye_batch, 
+@fp32_matmul
+def _meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all,
+                         r_inv_sqrt, r_inv, eye_batch,
                          tikhonov_lambda=0.1, huber_c=2.0):
     res_abs = torch.abs(residual_all)
     adapt_factor = torch.clamp(res_abs / huber_c, min=1.0)
